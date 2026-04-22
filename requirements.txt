@@ -1,0 +1,26 @@
+# Core ML
+torch==2.6.0
+torchvision==0.21.0
+captum==0.7.0
+
+# Image processing
+opencv-python-headless==4.10.0.84
+Pillow==12.2.0
+numpy==1.26.4
+
+# Dataset / data processing
+scikit-learn==1.5.1
+imbalanced-learn==0.12.3
+pandas==2.2.2
+
+# Dashboard
+streamlit==1.37.0
+plotly==5.23.0
+
+# Reporting (M8 — install now, implement later)
+fpdf2==2.7.9
+
+# Utilities
+python-dotenv==1.0.1
+tqdm==4.66.5
+pytest==8.3.2
