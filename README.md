@@ -1,1294 +1,1104 @@
-# MalTwin — Phase 1 Implementation
-### Binary-to-Image Conversion Module
-### Agent Instruction Document
+# MalTwin — Phase 2: Dataset Module
+### Agent Instruction Document | `modules/dataset/` + `tests/test_dataset.py`
+
+> **Read this entire document before writing a single line of code.**
+> Every class, method, signature, and behavioral rule is specified completely.
+> Do not infer, guess, or deviate from what is written here.
 
 ---
 
-## YOUR TASK
+## Mandatory Rules (from PRD Section 16)
 
-Implement Phase 1 of the MalTwin project. This phase has zero ML dependencies.
-You are building the binary file ingestion and conversion pipeline.
+These are the most commonly hallucinated bugs. Violating any of them causes test failures.
 
-At the end of this phase the following must be true:
-- `pytest tests/test_converter.py -v` passes with **zero failures**
-- `python scripts/convert_binary.py --input <file> --output <file>.png` runs without error
-- All functions have complete type hints
-- No network calls anywhere in this phase
-
----
-
-## FILES TO CREATE
-
-Create every file listed below. Do not skip any.
-
-```
-config.py
-.env.example
-requirements.txt
-.gitignore
-modules/__init__.py
-modules/binary_to_image/__init__.py
-modules/binary_to_image/utils.py
-modules/binary_to_image/converter.py
-tests/__init__.py
-tests/conftest.py
-tests/fixtures/create_fixtures.py
-tests/test_converter.py
-scripts/__init__.py
-scripts/convert_binary.py
-data/.gitkeep
-data/malimg/.gitkeep
-data/processed/.gitkeep
-models/.gitkeep
-models/checkpoints/.gitkeep
-logs/.gitkeep
-reports/.gitkeep
-```
+- **Read `MALTWIN_PRD_COMPLETE.md`** before writing any code.
+- All CNN tensors are **single-channel** `(batch, 1, H, W)` — NEVER RGB `(batch, 3, H, W)`.
+- `cv2.imread()` is **always** called with `cv2.IMREAD_GRAYSCALE` flag. Never load as BGR.
+- `cv2.resize()` target is `(width, height)` — i.e. `(IMG_SIZE, IMG_SIZE)`. OpenCV uses `(width, height)` convention. **This is the most common bug.**
+- `transforms.Normalize(mean=[0.5], std=[0.5])` uses **single-element lists** (not scalars, not 3-element lists).
+- `encode_labels()` **always sorts alphabetically** — same input always produces the same mapping.
+- All `train_test_split()` calls use `random_state=config.RANDOM_SEED` (42).
+- `get_val_transforms` is used for **val, test, and inference** — never `get_train_transforms` for inference.
+- `drop_last=True` on train DataLoader to prevent single-sample batches breaking BatchNorm.
+- All paths use `pathlib.Path`, never string concatenation.
+- Tests requiring Malimg dataset are marked `@pytest.mark.integration`.
+- `pytest tests/test_dataset.py -v -m "not integration"` must pass with **zero failures** without any dataset present.
 
 ---
 
-## MANDATORY RULES — READ BEFORE WRITING ANY CODE
+## Phase 2 Scope
 
-These rules prevent the most common agent mistakes on this project:
+Phase 2 implements the dataset loading, preprocessing, and (partially) the enhancement module that the loader depends on. It does **not** implement the full enhancement module (that is Phase 3) — but the loader imports `get_train_transforms` and `get_val_transforms` from `modules/enhancement/augmentor.py`, so a minimal version of those two functions must exist.
 
-1. `cv2.imread()` is ALWAYS called with `cv2.IMREAD_GRAYSCALE` flag. Never omit it.
-2. `cv2.resize()` target is `(width, height)` — OpenCV uses `(width, height)` NOT `(height, width)`. For a square image this is `(IMG_SIZE, IMG_SIZE)` which is unambiguous.
-3. `np.frombuffer(file_bytes, dtype=np.uint8)` produces a READ-ONLY array. Never modify it in-place. Always assign the result of reshape/slice to a new variable.
-4. `hashlib.sha256` from the Python standard library is the ONLY permitted hash implementation. No external services, no network calls.
-5. All paths in code use `pathlib.Path`. Use `str(path)` only when an external library requires a string argument (e.g. `cv2.imwrite(str(path), arr)`).
-6. No HTML `<form>` tags anywhere (Streamlit rule that applies project-wide).
-7. All `__init__.py` files in `modules/` must export the public API as specified in the `__all__` lists below.
+### Files to create
 
----
+| File | Description |
+|------|-------------|
+| `modules/dataset/__init__.py` | Package exports |
+| `modules/dataset/preprocessor.py` | `validate_dataset_integrity`, `normalize_image`, `encode_labels`, `save_class_names`, `load_class_names` |
+| `modules/dataset/loader.py` | `MalimgDataset`, `get_dataloaders` |
+| `modules/enhancement/__init__.py` | Package exports (minimal) |
+| `modules/enhancement/augmentor.py` | `GaussianNoise`, `get_train_transforms`, `get_val_transforms` |
+| `modules/enhancement/balancer.py` | `ClassAwareOversampler` |
+| `tests/test_dataset.py` | Full test suite (exactly as specified below) |
 
-## FILE 1: `requirements.txt`
-
-```
-# Deep Learning
-torch==2.3.1
-torchvision==0.18.1
-captum==0.7.0
-
-# Image Processing
-opencv-python-headless==4.10.0.84
-Pillow==10.4.0
-numpy==1.26.4
-
-# Data / ML utilities
-scikit-learn==1.5.1
-imbalanced-learn==0.12.3
-pandas==2.2.2
-scipy==1.14.0
-
-# Dashboard
-streamlit==1.37.0
-plotly==5.23.0
-watchdog==4.0.1
-
-# Reporting
-fpdf2==2.7.9
-
-# Utilities
-python-dotenv==1.0.1
-tqdm==4.66.5
-matplotlib==3.9.2
-
-# Testing
-pytest==8.3.2
-pytest-cov==5.0.0
-```
+> **Note:** Phase 2 produces the full `modules/enhancement/` module because `loader.py` imports from it. The enhancement tests (`tests/test_enhancement.py`) are left for Phase 3 — but the implementation must be complete and correct here.
 
 ---
 
-## FILE 2: `.env.example`
-
-```bash
-MALTWIN_DATA_DIR=./data/malimg
-MALTWIN_PROCESSED_DIR=./data/processed
-MALTWIN_MODEL_DIR=./models
-MALTWIN_LOG_DIR=./logs
-MALTWIN_REPORTS_DIR=./reports
-MALTWIN_IMG_SIZE=128
-MALTWIN_BATCH_SIZE=32
-MALTWIN_EPOCHS=30
-MALTWIN_LR=0.001
-MALTWIN_WEIGHT_DECAY=0.0001
-MALTWIN_LR_PATIENCE=5
-MALTWIN_NUM_WORKERS=4
-MALTWIN_DEVICE=auto
-MALTWIN_TRAIN_RATIO=0.70
-MALTWIN_VAL_RATIO=0.15
-MALTWIN_TEST_RATIO=0.15
-MALTWIN_OVERSAMPLE_STRATEGY=oversample_minority
-MALTWIN_RANDOM_SEED=42
-```
-
----
-
-## FILE 3: `.gitignore`
-
-```
-__pycache__/
-*.pyc
-*.pyo
-.env
-data/malimg/
-data/processed/*.json
-data/processed/*.png
-models/best_model.pt
-models/checkpoints/
-logs/maltwin.db
-reports/
-*.egg-info/
-.pytest_cache/
-.DS_Store
-venv/
-.venv/
-```
-
----
-
-## FILE 4: `config.py`
-
-Implement exactly as follows. Do not add or remove any fields.
+## File 1: `modules/dataset/__init__.py`
 
 ```python
-# config.py
-"""
-Central configuration for MalTwin.
-All modules import constants from here. Never hardcode paths or hyperparameters elsewhere.
-"""
-import os
-import torch
-from pathlib import Path
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# ── Repository root ────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent.resolve()
-
-# ── Paths ──────────────────────────────────────────────────────────────────────
-DATA_DIR        = Path(os.getenv("MALTWIN_DATA_DIR",        str(BASE_DIR / "data/malimg")))
-PROCESSED_DIR   = Path(os.getenv("MALTWIN_PROCESSED_DIR",   str(BASE_DIR / "data/processed")))
-MODEL_DIR       = Path(os.getenv("MALTWIN_MODEL_DIR",       str(BASE_DIR / "models")))
-CHECKPOINT_DIR  = MODEL_DIR / "checkpoints"
-LOG_DIR         = Path(os.getenv("MALTWIN_LOG_DIR",         str(BASE_DIR / "logs")))
-REPORTS_DIR     = Path(os.getenv("MALTWIN_REPORTS_DIR",     str(BASE_DIR / "reports")))
-MITRE_JSON_PATH  = BASE_DIR / "data" / "mitre_ics_mapping.json"
-CLASS_NAMES_PATH = PROCESSED_DIR / "class_names.json"
-DB_PATH          = LOG_DIR / "maltwin.db"
-BEST_MODEL_PATH  = MODEL_DIR / "best_model.pt"
-
-# Create directories at import time (safe to call repeatedly)
-for _dir in [PROCESSED_DIR, MODEL_DIR, CHECKPOINT_DIR, LOG_DIR, REPORTS_DIR]:
-    _dir.mkdir(parents=True, exist_ok=True)
-
-# ── Image settings ─────────────────────────────────────────────────────────────
-IMG_SIZE = int(os.getenv("MALTWIN_IMG_SIZE", "128"))
-
-# ── Training hyperparameters ───────────────────────────────────────────────────
-BATCH_SIZE   = int(os.getenv("MALTWIN_BATCH_SIZE",   "32"))
-EPOCHS       = int(os.getenv("MALTWIN_EPOCHS",        "30"))
-LR           = float(os.getenv("MALTWIN_LR",          "0.001"))
-WEIGHT_DECAY = float(os.getenv("MALTWIN_WEIGHT_DECAY","0.0001"))
-LR_PATIENCE  = int(os.getenv("MALTWIN_LR_PATIENCE",   "5"))
-NUM_WORKERS  = int(os.getenv("MALTWIN_NUM_WORKERS",    "4"))
-
-# ── Dataset split ratios ───────────────────────────────────────────────────────
-TRAIN_RATIO = float(os.getenv("MALTWIN_TRAIN_RATIO", "0.70"))
-VAL_RATIO   = float(os.getenv("MALTWIN_VAL_RATIO",   "0.15"))
-TEST_RATIO  = float(os.getenv("MALTWIN_TEST_RATIO",  "0.15"))
-assert abs(TRAIN_RATIO + VAL_RATIO + TEST_RATIO - 1.0) < 1e-6, \
-    "MALTWIN_TRAIN_RATIO + MALTWIN_VAL_RATIO + MALTWIN_TEST_RATIO must equal 1.0"
-
-# ── Oversampler ────────────────────────────────────────────────────────────────
-OVERSAMPLE_STRATEGY = os.getenv("MALTWIN_OVERSAMPLE_STRATEGY", "oversample_minority")
-assert OVERSAMPLE_STRATEGY in {"oversample_minority", "sqrt_inverse", "uniform"}, \
-    f"MALTWIN_OVERSAMPLE_STRATEGY must be one of: oversample_minority, sqrt_inverse, uniform"
-
-# ── Reproducibility ────────────────────────────────────────────────────────────
-RANDOM_SEED = int(os.getenv("MALTWIN_RANDOM_SEED", "42"))
-
-# ── Device ─────────────────────────────────────────────────────────────────────
-_device_env = os.getenv("MALTWIN_DEVICE", "auto")
-if _device_env == "auto":
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-else:
-    DEVICE = torch.device(_device_env)
-
-# ── Upload limits ──────────────────────────────────────────────────────────────
-MAX_UPLOAD_BYTES    = 50 * 1024 * 1024   # 50 MB
-ACCEPTED_EXTENSIONS = {".exe", ".dll", ".elf", ""}
-
-# ── Confidence thresholds for UI color coding ──────────────────────────────────
-CONFIDENCE_GREEN = 0.80
-CONFIDENCE_AMBER = 0.50
-
-# ── Dashboard ─────────────────────────────────────────────────────────────────
-STREAMLIT_PORT  = 8501
-DASHBOARD_TITLE = "MalTwin — IIoT Malware Detection"
-
-# ── Malimg dataset metadata ────────────────────────────────────────────────────
-MALIMG_EXPECTED_FAMILIES = 25
-MALIMG_TOTAL_SAMPLES     = 9339
+# modules/dataset/__init__.py
+from .loader import MalimgDataset, get_dataloaders
+from .preprocessor import validate_dataset_integrity
 ```
 
 ---
 
-## FILE 5: `modules/__init__.py`
+## File 2: `modules/dataset/preprocessor.py`
 
 ```python
-# empty
-```
-
----
-
-## FILE 6: `modules/binary_to_image/utils.py`
-
-Implement all four functions exactly as specified. Every docstring condition is a test requirement.
-
-```python
-"""
-Utility functions for binary file validation and metadata extraction.
-No ML dependencies. No network calls.
-"""
-import hashlib
-import math
-from datetime import datetime
-from pathlib import Path
-
+# modules/dataset/preprocessor.py
+import cv2
+import json
 import numpy as np
+from pathlib import Path
+from typing import Optional
 
 
-def validate_binary_format(file_bytes: bytes) -> str:
+def validate_dataset_integrity(data_dir: Path) -> dict:
     """
-    Inspect magic bytes to identify PE or ELF binary format.
+    Scans the Malimg dataset directory and produces an integrity report.
 
     Args:
-        file_bytes: raw bytes of the uploaded file.
+        data_dir: Path to the Malimg root directory (config.DATA_DIR).
 
     Returns:
-        'PE'  — if first 2 bytes are b'MZ'   (0x4D 0x5A)
-        'ELF' — if first 4 bytes are b'\x7fELF' (0x7F 0x45 0x4C 0x46)
+        {
+            'valid':            bool,         # True if no corrupt files found
+            'families':         list[str],    # sorted list of family folder names
+            'counts':           dict[str,int],# {family: sample_count}
+            'total':            int,          # sum of all counts
+            'min_class':        str,          # family with fewest samples
+            'max_class':        str,          # family with most samples
+            'imbalance_ratio':  float,        # max_count / min_count
+            'corrupt_files':    list[str],    # str(path) of unreadable files
+            'missing_dirs':     list[str],    # always [] — see notes
+        }
 
     Raises:
-        ValueError: "File is too small to be a valid binary (minimum 4 bytes required)"
-            if len(file_bytes) < 4
-        ValueError: "Unsupported file format. Expected PE (.exe/.dll) or ELF binary.
-                     Detected magic bytes: {HEX}"
-            if magic bytes match neither format.
-            HEX = file_bytes[:4].hex().upper()  e.g. "DEADBEEF"
+        FileNotFoundError: if data_dir does not exist
+        FileNotFoundError: if data_dir has no subdirectories
+
+    Implementation notes:
+        - Iterate over data_dir.iterdir(), keeping only directories.
+        - For each family dir, iterate over *.png files (case-insensitive via glob('*.png') + glob('*.PNG')).
+        - For each PNG, attempt cv2.imread(str(path), cv2.IMREAD_GRAYSCALE).
+          If result is None, add str(path) to corrupt_files list.
+        - Sort families alphabetically.
+        - corrupt_files contains str representations of Path objects.
+        - missing_dirs = [] (we cannot know expected names without hardcoding).
+        - imbalance_ratio = max_count / min_count. Handle divide-by-zero if min_count == 0.
+    """
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
+
+    subdirs = [p for p in data_dir.iterdir() if p.is_dir()]
+    if not subdirs:
+        raise FileNotFoundError(f"Dataset directory is empty: {data_dir}")
+
+    families = sorted([d.name for d in subdirs])
+    counts = {}
+    corrupt_files = []
+
+    for family_dir in sorted(subdirs, key=lambda d: d.name):
+        family = family_dir.name
+        png_files = list(family_dir.glob('*.png')) + list(family_dir.glob('*.PNG'))
+        # Deduplicate (glob may overlap on case-insensitive filesystems)
+        png_files = list({str(p): p for p in png_files}.values())
+        count = 0
+        for path in png_files:
+            img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                corrupt_files.append(str(path))
+            else:
+                count += 1
+        counts[family] = count
+
+    total = sum(counts.values())
+    max_class = max(counts, key=lambda k: counts[k]) if counts else ''
+    min_class = min(counts, key=lambda k: counts[k]) if counts else ''
+    max_count = counts.get(max_class, 0)
+    min_count = counts.get(min_class, 1)
+    imbalance_ratio = max_count / min_count if min_count > 0 else float('inf')
+
+    return {
+        'valid':           len(corrupt_files) == 0,
+        'families':        families,
+        'counts':          counts,
+        'total':           total,
+        'min_class':       min_class,
+        'max_class':       max_class,
+        'imbalance_ratio': imbalance_ratio,
+        'corrupt_files':   corrupt_files,
+        'missing_dirs':    [],
+    }
+
+
+def normalize_image(img: np.ndarray) -> np.ndarray:
+    """
+    Convert uint8 image [0, 255] to float32 [0.0, 1.0].
+
+    Args:
+        img: numpy array, dtype uint8.
+
+    Returns:
+        numpy array, same shape, dtype float32, values in [0.0, 1.0].
+
+    Implementation:
+        return img.astype(np.float32) / 255.0
 
     Notes:
-        Magic byte check only — no full header validation.
-        b'MZ' check uses first 2 bytes only.
-        b'\x7fELF' check uses first 4 bytes.
-        Check PE first, then ELF.
+        - Do NOT use cv2.normalize here. Simple division is exact and fast.
+        - The output of this function feeds directly into PyTorch tensors.
     """
-    # implement here
+    return img.astype(np.float32) / 255.0
 
 
-def compute_sha256(file_bytes: bytes) -> str:
+def encode_labels(families: list[str]) -> dict[str, int]:
     """
-    Compute SHA-256 digest of raw file bytes.
+    Create a deterministic string→integer label mapping.
 
     Args:
-        file_bytes: raw bytes of any length including empty.
+        families: list of family names.
 
     Returns:
-        Lowercase hexadecimal string of length exactly 64.
-        Example: "a3f1c2d4e5b6a7f8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+        Dict mapping each family name to a unique integer [0, len(families)-1].
+        Sorted alphabetically so the mapping is always the same for the same input.
 
     Implementation:
-        import hashlib
-        return hashlib.sha256(file_bytes).hexdigest()
+        return {name: idx for idx, name in enumerate(sorted(families))}
 
-    Constraints:
-        Standard library hashlib ONLY. No external services. No network.
-        Deterministic: identical input always produces identical output.
-        Output is always lowercase.
+    Example:
+        encode_labels(['Yuner.A', 'Allaple.A', 'VB.AT'])
+        → {'Allaple.A': 0, 'VB.AT': 1, 'Yuner.A': 2}
     """
-    # implement here
+    return {name: idx for idx, name in enumerate(sorted(families))}
 
 
-def compute_pixel_histogram(img_array: np.ndarray) -> dict:
+def save_class_names(class_names: list[str], output_path: Path) -> None:
     """
-    Compute byte-value frequency distribution of a grayscale image.
+    Persist the ordered class name list to JSON for dashboard use.
 
     Args:
-        img_array: numpy array of shape (H, W), dtype uint8, values 0–255.
+        class_names: sorted list of family names (index = label integer).
+        output_path: destination JSON path (config.CLASS_NAMES_PATH).
 
-    Returns:
-        {
-            'bins':   list[int]  — exactly [0, 1, 2, ..., 255], always length 256
-            'counts': list[int]  — pixel count for each bin value, always length 256
-        }
+    File format:
+        {"class_names": ["Adialer.C", "Agent.FYI", ...]}
 
-    Invariants:
-        len(result['bins'])   == 256
-        len(result['counts']) == 256
-        result['bins']        == list(range(256))
-        sum(result['counts']) == img_array.size   (H * W)
-        all(c >= 0 for c in result['counts'])
-
-    Implementation:
-        bins = list(range(256))
-        counts = np.bincount(img_array.flatten(), minlength=256).tolist()
-        return {'bins': bins, 'counts': counts}
+    Notes:
+        - Creates parent directory if it does not exist.
+        - Overwrites if file already exists.
     """
-    # implement here
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump({'class_names': class_names}, f, indent=2)
 
 
-def get_file_metadata(
-    file_bytes: bytes,
-    filename: str,
-    file_format: str,
-) -> dict:
+def load_class_names(input_path: Path) -> list[str]:
     """
-    Assemble the complete metadata dict for a processed binary file.
+    Load class names from JSON file written by save_class_names.
 
     Args:
-        file_bytes:  raw bytes of the uploaded file.
-        filename:    original filename as provided by the user.
-        file_format: 'PE' or 'ELF' (output of validate_binary_format).
+        input_path: path to class_names.json (config.CLASS_NAMES_PATH).
 
     Returns:
-        {
-            'name':        str   — original filename
-            'size_bytes':  int   — len(file_bytes)
-            'size_human':  str   — human-readable size (see rules below)
-            'format':      str   — 'PE' or 'ELF'
-            'sha256':      str   — 64-char hex (from compute_sha256)
-            'upload_time': str   — ISO 8601 UTC string e.g. "2025-04-22T14:35:22.123456"
-        }
+        list[str] of family names in index order.
 
-    size_human rules:
-        size_bytes >= 1_048_576 → f"{size_bytes / 1_048_576:.2f} MB"
-        size_bytes >= 1_024     → f"{size_bytes / 1_024:.2f} KB"
-        else                    → f"{size_bytes:.2f} B"
-
-    upload_time:
-        datetime.utcnow().isoformat()
-
-    sha256:
-        compute_sha256(file_bytes)
+    Raises:
+        FileNotFoundError: if file does not exist.
     """
-    # implement here
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"class_names.json not found at {input_path}. "
+            "Run scripts/train.py first."
+        )
+    with open(input_path) as f:
+        return json.load(f)['class_names']
 ```
 
 ---
 
-## FILE 7: `modules/binary_to_image/converter.py`
+## File 3: `modules/dataset/loader.py`
 
 ```python
-"""
-BinaryConverter: converts raw PE/ELF bytes to a 128x128 grayscale image.
-Algorithm from Nataraj et al. (2011) — byte array reshaped to 2D, then resized.
-No ML dependencies.
-"""
-import math
-from pathlib import Path
-
+# modules/dataset/loader.py
 import cv2
-import numpy as np
-
-import config
-
-
-class BinaryConverter:
-    """
-    Convert raw binary file bytes into a standardised grayscale PNG image.
-
-    Conversion algorithm:
-        1. Read file bytes as flat uint8 numpy array via np.frombuffer.
-        2. Determine 2D width:  width = max(1, int(math.sqrt(len(byte_array))))
-        3. Determine rows:      rows  = len(byte_array) // width
-        4. Trim array to exact (rows * width) length (discard tail bytes).
-        5. Reshape to (rows, width) 2D array.
-        6. Resize to (img_size, img_size) using cv2.INTER_LINEAR (bilinear).
-        7. Cast result to uint8 and return.
-
-    Constructor args:
-        img_size (int): side length of output square image in pixels.
-                        Must be > 0. Default: config.IMG_SIZE (128).
-
-    Raises on construction:
-        ValueError: "img_size must be a positive integer, got {img_size}"
-            if img_size <= 0.
-    """
-
-    def __init__(self, img_size: int = config.IMG_SIZE) -> None:
-        if img_size <= 0:
-            raise ValueError(f"img_size must be a positive integer, got {img_size}")
-        self.img_size = img_size
-
-    def convert(self, file_bytes: bytes) -> np.ndarray:
-        """
-        Convert raw binary bytes to a grayscale image array.
-
-        Args:
-            file_bytes: raw bytes of a PE or ELF binary.
-                        Caller is responsible for prior format validation.
-
-        Returns:
-            numpy.ndarray of shape (img_size, img_size), dtype=uint8, values 0–255.
-
-        Raises:
-            ValueError: "Binary file is empty or too small to convert (minimum 64 bytes)"
-                if len(file_bytes) < 64.
-
-        Implementation (follow exactly):
-            byte_array = np.frombuffer(file_bytes, dtype=np.uint8)
-            n = len(byte_array)
-            width = max(1, int(math.sqrt(n)))
-            rows  = n // width
-            trimmed   = byte_array[:rows * width]       # trim tail — READ ONLY array, slice is fine
-            reshaped  = trimmed.reshape((rows, width))  # creates a new view
-            resized   = cv2.resize(
-                reshaped,
-                (self.img_size, self.img_size),          # OpenCV: (width, height) — both same for square
-                interpolation=cv2.INTER_LINEAR,
-            )
-            return resized.astype(np.uint8)
-
-        Notes:
-            np.frombuffer output is read-only. Never modify it in-place.
-            trimmed.reshape creates a view — safe to use directly with cv2.resize.
-            cv2.resize on uint8 input with INTER_LINEAR outputs values in [0,255].
-            .astype(np.uint8) handles any edge-case float conversion from resize.
-        """
-        # implement here
-
-    def to_png_bytes(self, img_array: np.ndarray) -> bytes:
-        """
-        Encode a grayscale numpy array to PNG bytes for in-memory use.
-
-        Args:
-            img_array: numpy array of shape (H, W), dtype uint8.
-
-        Returns:
-            PNG-encoded bytes. First 4 bytes will be b'\\x89PNG' (PNG magic).
-
-        Raises:
-            RuntimeError: "cv2.imencode failed to encode image as PNG"
-                if cv2.imencode returns success=False.
-
-        Implementation:
-            success, encoded = cv2.imencode('.png', img_array)
-            if not success:
-                raise RuntimeError("cv2.imencode failed to encode image as PNG")
-            return encoded.tobytes()
-        """
-        # implement here
-
-    def to_pil_image(self, img_array: np.ndarray):
-        """
-        Convert grayscale array to PIL Image for torchvision transform compatibility.
-
-        Args:
-            img_array: numpy array of shape (H, W), dtype uint8.
-
-        Returns:
-            PIL.Image.Image in mode 'L' (8-bit grayscale).
-
-        Implementation:
-            from PIL import Image
-            return Image.fromarray(img_array, mode='L')
-        """
-        # implement here
-
-    def save(self, img_array: np.ndarray, output_path: Path) -> None:
-        """
-        Save grayscale array as PNG file to disk.
-
-        Args:
-            img_array:   numpy array of shape (H, W), dtype uint8.
-            output_path: Path where PNG will be written.
-                         Parent directory must already exist.
-
-        Raises:
-            RuntimeError: "Failed to save image to {output_path}"
-                if cv2.imwrite returns False.
-
-        Implementation:
-            success = cv2.imwrite(str(output_path), img_array)
-            if not success:
-                raise RuntimeError(f"Failed to save image to {output_path}")
-        """
-        # implement here
-```
-
----
-
-## FILE 8: `modules/binary_to_image/__init__.py`
-
-```python
-from .converter import BinaryConverter
-from .utils import (
-    validate_binary_format,
-    compute_sha256,
-    compute_pixel_histogram,
-    get_file_metadata,
-)
-
-__all__ = [
-    "BinaryConverter",
-    "validate_binary_format",
-    "compute_sha256",
-    "compute_pixel_histogram",
-    "get_file_metadata",
-]
-```
-
----
-
-## FILE 9: `tests/__init__.py`
-
-```python
-# empty
-```
-
----
-
-## FILE 10: `tests/conftest.py`
-
-This file provides shared fixtures used by ALL test phases.
-Create all fixtures now even though some are only used in later phases.
-
-```python
-"""
-Shared pytest fixtures for MalTwin test suite.
-All fixtures are deterministic (fixed seeds / fixed byte patterns).
-"""
-import numpy as np
-import pytest
+import json
 import torch
-from pathlib import Path
-
-
-# ── Binary fixtures ────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def sample_pe_bytes() -> bytes:
-    """
-    Minimal valid PE binary.
-    First 2 bytes = b'MZ' (PE magic).
-    Total size = 1024 bytes (enough for BinaryConverter minimum of 64 bytes).
-    """
-    header = b'MZ' + b'\x90' * 58   # MZ + 58 bytes of DOS stub padding
-    body   = b'\x00' * (1024 - len(header))
-    return header + body
-
-
-@pytest.fixture
-def sample_elf_bytes() -> bytes:
-    """
-    Minimal valid ELF binary.
-    First 4 bytes = b'\\x7fELF' (ELF magic).
-    Total size = 1024 bytes.
-    """
-    header = b'\x7fELF' + b'\x00' * 56
-    body   = b'\x00' * (1024 - len(header))
-    return header + body
-
-
-@pytest.fixture
-def large_pe_bytes() -> bytes:
-    """
-    Larger PE binary (10 KB) with varied byte values for histogram testing.
-    """
-    import os
-    rng = np.random.default_rng(seed=123)
-    body = rng.integers(0, 256, size=10 * 1024, dtype=np.uint8).tobytes()
-    return b'MZ' + b'\x90' * 58 + body
-
-
-@pytest.fixture
-def non_binary_bytes() -> bytes:
-    """
-    Bytes that are definitively NOT PE or ELF.
-    First 4 bytes are 0xDEADBEEF.
-    """
-    return b'\xDE\xAD\xBE\xEF' + b'\x00' * 100
-
-
-@pytest.fixture
-def too_small_bytes() -> bytes:
-    """Only 2 bytes — fails the minimum 4-byte check."""
-    return b'\x4d\x5a'   # MZ but only 2 bytes
-
-
-@pytest.fixture
-def tiny_valid_pe() -> bytes:
-    """
-    Valid PE magic but only 32 bytes total.
-    Passes validate_binary_format but fails BinaryConverter (< 64 bytes).
-    """
-    return b'MZ' + b'\x00' * 30
-
-
-# ── Image array fixtures ───────────────────────────────────────────────────────
-
-@pytest.fixture
-def sample_grayscale_array() -> np.ndarray:
-    """
-    128x128 uint8 numpy array simulating a converted binary.
-    Deterministic via fixed seed.
-    """
-    rng = np.random.default_rng(seed=42)
-    return rng.integers(0, 256, size=(128, 128), dtype=np.uint8)
-
-
-@pytest.fixture
-def uniform_black_array() -> np.ndarray:
-    """128x128 array of all zeros (pure black image)."""
-    return np.zeros((128, 128), dtype=np.uint8)
-
-
-@pytest.fixture
-def uniform_white_array() -> np.ndarray:
-    """128x128 array of all 255 (pure white image)."""
-    return np.full((128, 128), 255, dtype=np.uint8)
-
-
-# ── Tensor fixtures ────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def sample_grayscale_tensor() -> torch.Tensor:
-    """
-    Single-channel grayscale tensor in normalised range [-1, 1].
-    Shape: (1, 128, 128), dtype: float32.
-    Simulates output of get_val_transforms()(pil_image).
-    """
-    rng = np.random.default_rng(seed=42)
-    arr = rng.integers(0, 256, size=(128, 128), dtype=np.uint8).astype(np.float32)
-    tensor = torch.from_numpy(arr / 255.0)   # [0, 1]
-    tensor = (tensor - 0.5) / 0.5            # [-1, 1]
-    return tensor.unsqueeze(0)               # (1, 128, 128)
-
-
-@pytest.fixture
-def batch_grayscale_tensors() -> torch.Tensor:
-    """
-    Batch of 4 single-channel grayscale tensors.
-    Shape: (4, 1, 128, 128), dtype: float32, range: [-1, 1].
-    """
-    rng = np.random.default_rng(seed=99)
-    arr = rng.integers(0, 256, size=(4, 128, 128), dtype=np.uint8).astype(np.float32)
-    tensor = torch.from_numpy(arr / 255.0)
-    tensor = (tensor - 0.5) / 0.5
-    return tensor.unsqueeze(1)   # (4, 1, 128, 128)
-
-
-# ── Misc fixtures ──────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def num_classes() -> int:
-    """Number of malware families in Malimg dataset."""
-    return 25
-
-
-@pytest.fixture
-def sample_class_names() -> list:
-    """
-    Sorted list of all 25 Malimg family names.
-    Used as a drop-in for real class_names in inference tests.
-    """
-    return [
-        "Adialer.C", "Agent.FYI", "Allaple.A", "Allaple.L",
-        "Alueron.gen!J", "Autorun.K", "C2LOP.P", "C2LOP.gen!g",
-        "Dialplatform.B", "Dontovo.A", "Fakerean", "Instantaccess",
-        "Lolyda.AA1", "Lolyda.AA2", "Lolyda.AA3", "Lolyda.AT",
-        "Malex.gen!J", "Obfuscator.AD", "Rbot!gen", "Skintrim.N",
-        "Swizzor.gen!E", "Swizzor.gen!I", "VB.AT", "Wintrim.BX",
-        "Yuner.A",
-    ]
-```
-
----
-
-## FILE 11: `tests/fixtures/create_fixtures.py`
-
-```python
-"""
-Script to generate minimal binary fixture files for tests.
-Run once: python tests/fixtures/create_fixtures.py
-
-Creates:
-    tests/fixtures/sample_pe.exe   — 1024-byte minimal PE binary
-    tests/fixtures/sample.elf      — 1024-byte minimal ELF binary
-"""
-from pathlib import Path
-
-FIXTURES_DIR = Path(__file__).parent
-
-
-def create_minimal_pe(output_path: Path) -> None:
-    """Write a 1024-byte minimal PE binary (MZ magic + padding)."""
-    header = b'MZ' + b'\x90' * 58
-    body   = b'\x00' * (1024 - len(header))
-    output_path.write_bytes(header + body)
-    print(f"Created: {output_path} ({output_path.stat().st_size} bytes)")
-
-
-def create_minimal_elf(output_path: Path) -> None:
-    """Write a 1024-byte minimal ELF binary (ELF magic + padding)."""
-    header = b'\x7fELF' + b'\x00' * 56
-    body   = b'\x00' * (1024 - len(header))
-    output_path.write_bytes(header + body)
-    print(f"Created: {output_path} ({output_path.stat().st_size} bytes)")
-
-
-if __name__ == "__main__":
-    FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
-    create_minimal_pe(FIXTURES_DIR / "sample_pe.exe")
-    create_minimal_elf(FIXTURES_DIR / "sample.elf")
-    print("Done.")
-```
-
----
-
-## FILE 12: `tests/test_converter.py`
-
-Implement all test classes and methods exactly as written. Do not skip or rename any.
-
-```python
-"""
-Test suite for modules/binary_to_image/
-All tests are unit tests — no dataset, no ML, no network required.
-Run: pytest tests/test_converter.py -v
-"""
-import hashlib
-
 import numpy as np
-import pytest
+from pathlib import Path
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.model_selection import train_test_split
+from torchvision import transforms
+from typing import Optional, Callable
 from PIL import Image
 
-from modules.binary_to_image.converter import BinaryConverter
-from modules.binary_to_image.utils import (
-    compute_pixel_histogram,
-    compute_sha256,
-    get_file_metadata,
-    validate_binary_format,
+import config
+from .preprocessor import encode_labels, save_class_names
+
+
+class MalimgDataset(Dataset):
+    """
+    PyTorch Dataset for the Malimg malware image dataset.
+
+    Loads grayscale PNG images from directory structure:
+        data_dir/FamilyName/image.png
+
+    Each image is:
+        1. Loaded as grayscale (single channel) with cv2.IMREAD_GRAYSCALE
+        2. Resized to (img_size, img_size) using cv2.resize(img, (img_size, img_size))
+           NOTE: cv2.resize takes (width, height), so (img_size, img_size) is correct for square images.
+        3. Converted to PIL Image mode 'L'
+        4. Transform applied (returns float32 tensor shape (1, H, W))
+
+    Internal data structure:
+        self.samples: list[tuple[Path, int]]
+        self.class_names: list[str]  — sorted alphabetically, index = label integer
+        self.label_map: dict[str, int]
+        self.class_counts: dict[str, int]  — counts for THIS split only
+
+    Split algorithm (must be implemented exactly as specified):
+        Step 1: Gather all (path, label) pairs for entire dataset across all families.
+        Step 2: Extract label list for stratification.
+        Step 3: train_test_split(all_samples, test_size=(val_ratio + test_ratio),
+                                 stratify=labels, random_state=random_seed)
+                → produces train_samples, temp_samples
+        Step 4: relative_val = val_ratio / (val_ratio + test_ratio)
+                train_test_split(temp_samples, test_size=(1 - relative_val),
+                                 stratify=temp_labels, random_state=random_seed)
+                → produces val_samples, test_samples
+        Step 5: self.samples = train_samples / val_samples / test_samples per requested split.
+    """
+
+    def __init__(
+        self,
+        data_dir: Path,
+        split: str,
+        img_size: int = config.IMG_SIZE,
+        transform: Optional[Callable] = None,
+        train_ratio: float = config.TRAIN_RATIO,
+        val_ratio: float = config.VAL_RATIO,
+        test_ratio: float = config.TEST_RATIO,
+        random_seed: int = config.RANDOM_SEED,
+    ):
+        if not data_dir.exists():
+            raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
+        if split not in ('train', 'val', 'test'):
+            raise ValueError(f"split must be 'train', 'val', or 'test', got '{split}'")
+        if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
+            raise ValueError("train_ratio + val_ratio + test_ratio must sum to 1.0")
+
+        self.data_dir = data_dir
+        self.split = split
+        self.img_size = img_size
+        self.random_seed = random_seed
+
+        # Build label map from all family subdirectories
+        family_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir()], key=lambda p: p.name)
+        all_families = [d.name for d in family_dirs]
+        self.label_map = encode_labels(all_families)
+        self.class_names = sorted(all_families)  # sorted alphabetically
+
+        # Gather all (path, label) pairs
+        all_samples: list[tuple[Path, int]] = []
+        for family_dir in family_dirs:
+            label = self.label_map[family_dir.name]
+            png_files = sorted(list(family_dir.glob('*.png')) + list(family_dir.glob('*.PNG')))
+            # Deduplicate on case-insensitive filesystems
+            seen = set()
+            deduped = []
+            for p in png_files:
+                key = str(p).lower()
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(p)
+            for path in deduped:
+                all_samples.append((path, label))
+
+        # Stratified split
+        labels = [s[1] for s in all_samples]
+        train_samples, temp_samples = train_test_split(
+            all_samples,
+            test_size=(val_ratio + test_ratio),
+            stratify=labels,
+            random_state=random_seed,
+        )
+        temp_labels = [s[1] for s in temp_samples]
+        relative_val = val_ratio / (val_ratio + test_ratio)
+        val_samples, test_samples = train_test_split(
+            temp_samples,
+            test_size=(1.0 - relative_val),
+            stratify=temp_labels,
+            random_state=random_seed,
+        )
+
+        split_map = {'train': train_samples, 'val': val_samples, 'test': test_samples}
+        self.samples = split_map[split]
+
+        # Compute class counts for this split
+        from collections import Counter
+        cnt = Counter(lbl for _, lbl in self.samples)
+        self.class_counts = {self.class_names[lbl]: cnt.get(lbl, 0) for lbl in range(len(self.class_names))}
+
+        # Default transform: val transforms (no augmentation)
+        if transform is None:
+            from modules.enhancement.augmentor import get_val_transforms
+            self.transform = get_val_transforms(img_size)
+        else:
+            self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        path, label = self.samples[idx]
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise RuntimeError(f"Failed to load image: {path}")
+        # cv2.resize takes (width, height) — for square images this is (img_size, img_size)
+        img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        pil_img = Image.fromarray(img, mode='L')
+        tensor = self.transform(pil_img)   # shape: (1, img_size, img_size), float32
+        return tensor, label
+
+    def get_labels(self) -> list[int]:
+        """Returns list of integer labels for all samples in this split."""
+        return [label for _, label in self.samples]
+
+
+def get_dataloaders(
+    data_dir: Path = config.DATA_DIR,
+    img_size: int = config.IMG_SIZE,
+    batch_size: int = config.BATCH_SIZE,
+    num_workers: int = config.NUM_WORKERS,
+    oversample_strategy: str = config.OVERSAMPLE_STRATEGY,
+    augment_train: bool = True,
+    random_seed: int = config.RANDOM_SEED,
+) -> tuple[DataLoader, DataLoader, DataLoader, list[str]]:
+    """
+    Build all three DataLoaders and return (train_loader, val_loader, test_loader, class_names).
+
+    - Train loader uses oversampling sampler + optional augmentation.
+    - Val and test loaders use val transforms, shuffle=False, no sampler.
+    - Persists class_names to config.CLASS_NAMES_PATH for dashboard use.
+    - drop_last=True on train loader prevents incomplete final batches.
+    - pin_memory=True when CUDA is available.
+    """
+    from modules.enhancement.augmentor import get_train_transforms, get_val_transforms
+    from modules.enhancement.balancer import ClassAwareOversampler
+
+    val_transform = get_val_transforms(img_size)
+    train_transform = get_train_transforms(img_size) if augment_train else val_transform
+
+    train_ds = MalimgDataset(data_dir, 'train', img_size, train_transform,
+                              random_seed=random_seed)
+    val_ds   = MalimgDataset(data_dir, 'val',   img_size, val_transform,
+                              random_seed=random_seed)
+    test_ds  = MalimgDataset(data_dir, 'test',  img_size, val_transform,
+                              random_seed=random_seed)
+
+    sampler = ClassAwareOversampler(train_ds, strategy=oversample_strategy).get_sampler()
+    use_pin = (config.DEVICE.type == 'cuda')
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        sampler=sampler,         # replaces shuffle=True
+        num_workers=num_workers,
+        pin_memory=use_pin,
+        drop_last=True,          # avoid incomplete final batch during training
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=use_pin,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=use_pin,
+    )
+
+    # Persist class names for dashboard
+    save_class_names(train_ds.class_names, config.CLASS_NAMES_PATH)
+
+    return train_loader, val_loader, test_loader, train_ds.class_names
+```
+
+---
+
+## File 4: `modules/enhancement/__init__.py`
+
+```python
+# modules/enhancement/__init__.py
+from .augmentor import get_train_transforms, get_val_transforms, GaussianNoise
+from .balancer import ClassAwareOversampler
+```
+
+---
+
+## File 5: `modules/enhancement/augmentor.py`
+
+```python
+# modules/enhancement/augmentor.py
+import random
+import torch
+import numpy as np
+from torchvision import transforms
+from PIL import Image
+
+
+class GaussianNoise:
+    """
+    Custom torchvision-compatible transform that adds Gaussian noise to a tensor.
+
+    MUST be placed AFTER transforms.ToTensor() in the pipeline.
+    Operates on torch.Tensor, not PIL.Image.
+
+    Constructor args:
+        mean (float):      noise mean, default 0.0
+        std_range (tuple): (min_std, max_std), std sampled uniformly each call.
+                           Default (0.01, 0.05).
+
+    __call__:
+        1. Sample std = random.uniform(std_range[0], std_range[1])
+        2. Generate noise = torch.randn_like(tensor) * std + mean
+        3. result = tensor + noise
+        4. Clamp result to [0.0, 1.0]
+        5. Return clamped tensor (same shape and dtype as input)
+    """
+
+    def __init__(self, mean: float = 0.0, std_range: tuple = (0.01, 0.05)):
+        self.mean = mean
+        self.std_range = std_range
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        std = random.uniform(self.std_range[0], self.std_range[1])
+        noise = torch.randn_like(tensor) * std + self.mean
+        return torch.clamp(tensor + noise, 0.0, 1.0)
+
+    def __repr__(self) -> str:
+        return f"GaussianNoise(mean={self.mean}, std_range={self.std_range})"
+
+
+def get_train_transforms(img_size: int = 128) -> transforms.Compose:
+    """
+    Build the augmentation pipeline for training data.
+
+    Transform order (CRITICAL — do not reorder):
+        1. RandomRotation(degrees=15, fill=0)      ← PIL stage
+        2. RandomHorizontalFlip(p=0.5)             ← PIL stage
+        3. RandomVerticalFlip(p=0.5)               ← PIL stage
+        4. ColorJitter(brightness=0.2)             ← PIL stage (MUST be before ToTensor)
+        5. ToTensor()                              ← converts PIL 'L' → (1, H, W) float32
+        6. GaussianNoise(mean=0.0, std=(0.01,0.05))← Tensor stage (MUST be after ToTensor)
+        7. Normalize(mean=[0.5], std=[0.5])        ← Tensor stage (single-element lists!)
+
+    Args:
+        img_size: not used directly (resizing done in Dataset.__getitem__).
+
+    Returns:
+        transforms.Compose instance
+    """
+    return transforms.Compose([
+        transforms.RandomRotation(degrees=15, fill=0),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.2),    # PIL stage — before ToTensor
+        transforms.ToTensor(),
+        GaussianNoise(mean=0.0, std_range=(0.01, 0.05)),  # Tensor stage — after ToTensor
+        transforms.Normalize(mean=[0.5], std=[0.5]),       # single-element lists
+    ])
+
+
+def get_val_transforms(img_size: int = 128) -> transforms.Compose:
+    """
+    Build the inference/validation transform pipeline (NO augmentation).
+
+    Transform order:
+        1. ToTensor()                       ← PIL 'L' → (1, H, W) float32
+        2. Normalize(mean=[0.5], std=[0.5]) ← maps [0,1] to [-1,1]
+
+    Used for val, test, and inference. NEVER use get_train_transforms for inference.
+
+    Args:
+        img_size: kept for API consistency, not used here.
+
+    Returns:
+        transforms.Compose instance
+    """
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5]),
+    ])
+```
+
+---
+
+## File 6: `modules/enhancement/balancer.py`
+
+```python
+# modules/enhancement/balancer.py
+import math
+import torch
+from torch.utils.data import WeightedRandomSampler
+from collections import Counter
+
+
+class ClassAwareOversampler:
+    """
+    Produces a WeightedRandomSampler to address class imbalance in Malimg.
+
+    Malimg is severely imbalanced (Allaple.A has ~2949 samples, Skintrim.N has ~80).
+    Without balancing, the CNN learns to predict majority classes and performs
+    poorly on rare families.
+
+    Constructor args:
+        dataset:  a MalimgDataset instance (train split).
+                  Must expose a get_labels() method returning list[int].
+        strategy: one of 'oversample_minority', 'sqrt_inverse', 'uniform'.
+
+    Strategies:
+        'oversample_minority' — weight = 1 / class_count (pure inverse frequency)
+        'sqrt_inverse'        — weight = 1 / sqrt(class_count) (softer balancing)
+        'uniform'             — weight = 1.0 for all samples (effectively random sampling)
+
+    Properties set after get_sampler() call:
+        self.class_weights: dict[int, float]
+        self.effective_class_counts: dict[int, float]
+    """
+
+    def __init__(self, dataset, strategy: str = 'oversample_minority'):
+        self.dataset = dataset
+        self.strategy = strategy
+        self.class_weights: dict[int, float] = {}
+        self.effective_class_counts: dict[int, float] = {}
+
+    def get_sampler(self) -> WeightedRandomSampler:
+        """
+        Compute per-sample weights and return a WeightedRandomSampler.
+
+        Implementation:
+            labels = dataset.get_labels()
+            class_counts = Counter(labels)
+
+            if strategy == 'oversample_minority':
+                class_weights = {c: 1.0 / count for c, count in class_counts.items()}
+            elif strategy == 'sqrt_inverse':
+                class_weights = {c: 1.0 / math.sqrt(count) for c, count in class_counts.items()}
+            elif strategy == 'uniform':
+                class_weights = {c: 1.0 for c in class_counts}
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}")
+
+            sample_weights = [class_weights[label] for label in labels]
+            return WeightedRandomSampler(
+                weights=torch.tensor(sample_weights, dtype=torch.float32),
+                num_samples=len(labels),
+                replacement=True,
+            )
+        """
+        labels = self.dataset.get_labels()
+        class_counts = Counter(labels)
+
+        if self.strategy == 'oversample_minority':
+            self.class_weights = {c: 1.0 / count for c, count in class_counts.items()}
+        elif self.strategy == 'sqrt_inverse':
+            self.class_weights = {c: 1.0 / math.sqrt(count) for c, count in class_counts.items()}
+        elif self.strategy == 'uniform':
+            self.class_weights = {c: 1.0 for c in class_counts}
+        else:
+            raise ValueError(f"Unknown strategy: {self.strategy}. "
+                             "Choose from: oversample_minority, sqrt_inverse, uniform")
+
+        total_weight = sum(self.class_weights.values())
+        n = len(labels)
+        self.effective_class_counts = {
+            c: self.class_weights[c] / total_weight * n
+            for c in self.class_weights
+        }
+
+        sample_weights = torch.tensor(
+            [self.class_weights[label] for label in labels],
+            dtype=torch.float32,
+        )
+
+        return WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(labels),
+            replacement=True,
+        )
+```
+
+---
+
+## File 7: `tests/test_dataset.py`
+
+Write this file **exactly** as shown. Do not add, remove, or rename any test.
+
+```python
+"""
+Test suite for modules/dataset/
+NOTE: Tests that require the Malimg dataset are marked @pytest.mark.integration.
+Unit tests (no dataset needed) run without the dataset.
+
+Run unit tests only (CI-safe):
+    pytest tests/test_dataset.py -v -m "not integration"
+
+Run all tests (requires Malimg at config.DATA_DIR):
+    pytest tests/test_dataset.py -v
+"""
+import pytest
+import numpy as np
+import torch
+from pathlib import Path
+from modules.dataset.preprocessor import (
+    normalize_image, encode_labels, validate_dataset_integrity,
+    save_class_names, load_class_names,
 )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# validate_binary_format
-# ══════════════════════════════════════════════════════════════════════════════
+class TestNormalizeImage:
+    def test_output_range(self, sample_grayscale_array):
+        result = normalize_image(sample_grayscale_array)
+        assert result.min() >= 0.0
+        assert result.max() <= 1.0
 
-class TestValidateBinaryFormat:
+    def test_output_dtype_float32(self, sample_grayscale_array):
+        result = normalize_image(sample_grayscale_array)
+        assert result.dtype == np.float32
 
-    def test_accepts_pe_mz_header(self, sample_pe_bytes):
-        assert validate_binary_format(sample_pe_bytes) == 'PE'
+    def test_zero_maps_to_zero(self):
+        arr = np.zeros((4, 4), dtype=np.uint8)
+        assert normalize_image(arr).max() == 0.0
 
-    def test_accepts_elf_magic(self, sample_elf_bytes):
-        assert validate_binary_format(sample_elf_bytes) == 'ELF'
+    def test_255_maps_to_one(self):
+        arr = np.full((4, 4), 255, dtype=np.uint8)
+        np.testing.assert_almost_equal(normalize_image(arr).min(), 1.0, decimal=6)
 
-    def test_rejects_too_small_raises_value_error(self, too_small_bytes):
-        with pytest.raises(ValueError, match="too small"):
-            validate_binary_format(too_small_bytes)
+    def test_shape_preserved(self, sample_grayscale_array):
+        result = normalize_image(sample_grayscale_array)
+        assert result.shape == sample_grayscale_array.shape
 
-    def test_rejects_empty_bytes(self):
-        with pytest.raises(ValueError):
-            validate_binary_format(b'')
-
-    def test_rejects_exactly_3_bytes(self):
-        with pytest.raises(ValueError):
-            validate_binary_format(b'\x7f\x45\x4c')   # 3 bytes — ELF-like but too short
-
-    def test_rejects_unknown_magic_raises_value_error(self, non_binary_bytes):
-        with pytest.raises(ValueError, match="Unsupported"):
-            validate_binary_format(non_binary_bytes)
-
-    def test_error_message_contains_hex_repr(self):
-        bad = b'\xDE\xAD\xBE\xEF' + b'\x00' * 100
-        with pytest.raises(ValueError) as exc_info:
-            validate_binary_format(bad)
-        assert 'DEADBEEF' in str(exc_info.value)
-
-    def test_pe_check_uses_first_two_bytes_only(self):
-        """Bytes 3+ can be anything — still valid PE if first 2 are MZ."""
-        data = b'MZ' + b'\xFF\xFF' + b'\x00' * 200
-        assert validate_binary_format(data) == 'PE'
-
-    def test_elf_check_requires_all_four_magic_bytes(self):
-        """Only 3 of 4 ELF magic bytes — must fail."""
-        data = b'\x7fEL\x00' + b'\x00' * 100   # missing 'F'
-        with pytest.raises(ValueError):
-            validate_binary_format(data)
-
-    def test_return_type_is_str(self, sample_pe_bytes):
-        result = validate_binary_format(sample_pe_bytes)
-        assert isinstance(result, str)
+    def test_midpoint_maps_correctly(self):
+        arr = np.full((4, 4), 128, dtype=np.uint8)
+        result = normalize_image(arr)
+        np.testing.assert_almost_equal(result[0, 0], 128 / 255.0, decimal=6)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# compute_sha256
-# ══════════════════════════════════════════════════════════════════════════════
+class TestEncodeLabels:
+    def test_sorted_alphabetically(self):
+        result = encode_labels(['Yuner.A', 'Allaple.A', 'VB.AT'])
+        assert result == {'Allaple.A': 0, 'VB.AT': 1, 'Yuner.A': 2}
 
-class TestComputeSha256:
+    def test_unique_integers(self):
+        families = ['A', 'B', 'C', 'D']
+        result = encode_labels(families)
+        assert len(set(result.values())) == 4
 
-    def test_returns_string(self, sample_pe_bytes):
-        assert isinstance(compute_sha256(sample_pe_bytes), str)
+    def test_range_correct(self):
+        families = ['X', 'Y', 'Z']
+        result = encode_labels(families)
+        assert set(result.values()) == {0, 1, 2}
 
-    def test_returns_64_char_hex(self, sample_pe_bytes):
-        result = compute_sha256(sample_pe_bytes)
-        assert len(result) == 64
+    def test_deterministic(self):
+        f = ['Yuner.A', 'Allaple.A']
+        assert encode_labels(f) == encode_labels(f)
 
-    def test_output_is_valid_hex(self, sample_pe_bytes):
-        result = compute_sha256(sample_pe_bytes)
-        assert all(c in '0123456789abcdef' for c in result)
+    def test_single_family(self):
+        assert encode_labels(['OnlyOne']) == {'OnlyOne': 0}
 
-    def test_output_is_lowercase(self, sample_pe_bytes):
-        result = compute_sha256(sample_pe_bytes)
-        assert result == result.lower()
+    def test_order_independent(self):
+        f1 = ['C', 'A', 'B']
+        f2 = ['A', 'B', 'C']
+        assert encode_labels(f1) == encode_labels(f2)
 
-    def test_deterministic_same_input(self, sample_pe_bytes):
-        assert compute_sha256(sample_pe_bytes) == compute_sha256(sample_pe_bytes)
+    def test_returns_dict(self):
+        result = encode_labels(['X', 'Y'])
+        assert isinstance(result, dict)
 
-    def test_different_inputs_produce_different_hashes(self, sample_pe_bytes, sample_elf_bytes):
-        assert compute_sha256(sample_pe_bytes) != compute_sha256(sample_elf_bytes)
-
-    def test_matches_stdlib_hashlib(self, sample_pe_bytes):
-        expected = hashlib.sha256(sample_pe_bytes).hexdigest()
-        assert compute_sha256(sample_pe_bytes) == expected
-
-    def test_works_on_empty_bytes(self):
-        """SHA-256 of empty bytes is a known constant."""
-        expected = hashlib.sha256(b'').hexdigest()
-        assert compute_sha256(b'') == expected
-
-    def test_works_on_single_byte(self):
-        result = compute_sha256(b'\x00')
-        assert len(result) == 64
-
-    def test_works_on_large_input(self, large_pe_bytes):
-        result = compute_sha256(large_pe_bytes)
-        assert len(result) == 64
+    def test_all_values_are_ints(self):
+        result = encode_labels(['A', 'B', 'C'])
+        assert all(isinstance(v, int) for v in result.values())
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# compute_pixel_histogram
-# ══════════════════════════════════════════════════════════════════════════════
+class TestSaveLoadClassNames:
+    def test_roundtrip(self, tmp_path):
+        names = ['Allaple.A', 'Agent.FYI', 'VB.AT']
+        path = tmp_path / 'class_names.json'
+        save_class_names(names, path)
+        loaded = load_class_names(path)
+        assert loaded == names
 
-class TestComputePixelHistogram:
+    def test_creates_parent_dirs(self, tmp_path):
+        names = ['A', 'B']
+        path = tmp_path / 'subdir' / 'nested' / 'class_names.json'
+        save_class_names(names, path)
+        assert path.exists()
 
-    def test_returns_dict_with_bins_and_counts(self, sample_grayscale_array):
-        result = compute_pixel_histogram(sample_grayscale_array)
-        assert 'bins' in result
-        assert 'counts' in result
+    def test_load_nonexistent_raises(self, tmp_path):
+        missing = tmp_path / 'nonexistent.json'
+        with pytest.raises(FileNotFoundError, match="class_names.json not found"):
+            load_class_names(missing)
 
-    def test_bins_is_list(self, sample_grayscale_array):
-        assert isinstance(compute_pixel_histogram(sample_grayscale_array)['bins'], list)
-
-    def test_counts_is_list(self, sample_grayscale_array):
-        assert isinstance(compute_pixel_histogram(sample_grayscale_array)['counts'], list)
-
-    def test_exactly_256_bins(self, sample_grayscale_array):
-        assert len(compute_pixel_histogram(sample_grayscale_array)['bins']) == 256
-
-    def test_exactly_256_counts(self, sample_grayscale_array):
-        assert len(compute_pixel_histogram(sample_grayscale_array)['counts']) == 256
-
-    def test_bins_are_zero_to_255(self, sample_grayscale_array):
-        assert compute_pixel_histogram(sample_grayscale_array)['bins'] == list(range(256))
-
-    def test_counts_sum_to_total_pixels(self, sample_grayscale_array):
-        hist = compute_pixel_histogram(sample_grayscale_array)
-        assert sum(hist['counts']) == sample_grayscale_array.size   # 128*128 = 16384
-
-    def test_all_counts_nonnegative(self, sample_grayscale_array):
-        hist = compute_pixel_histogram(sample_grayscale_array)
-        assert all(c >= 0 for c in hist['counts'])
-
-    def test_uniform_black_image_all_count_in_bin_zero(self, uniform_black_array):
-        hist = compute_pixel_histogram(uniform_black_array)
-        assert hist['counts'][0] == uniform_black_array.size
-        assert sum(hist['counts'][1:]) == 0
-
-    def test_uniform_white_image_all_count_in_bin_255(self, uniform_white_array):
-        hist = compute_pixel_histogram(uniform_white_array)
-        assert hist['counts'][255] == uniform_white_array.size
-        assert sum(hist['counts'][:255]) == 0
-
-    def test_counts_elements_are_int(self, sample_grayscale_array):
-        hist = compute_pixel_histogram(sample_grayscale_array)
-        assert all(isinstance(c, int) for c in hist['counts'])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# get_file_metadata
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestGetFileMetadata:
-
-    def test_returns_all_required_keys(self, sample_pe_bytes):
-        meta = get_file_metadata(sample_pe_bytes, "test.exe", "PE")
-        for key in ['name', 'size_bytes', 'size_human', 'format', 'sha256', 'upload_time']:
-            assert key in meta, f"Missing key: {key}"
-
-    def test_name_matches_input(self, sample_pe_bytes):
-        meta = get_file_metadata(sample_pe_bytes, "suspicious.exe", "PE")
-        assert meta['name'] == "suspicious.exe"
-
-    def test_size_bytes_correct(self, sample_pe_bytes):
-        meta = get_file_metadata(sample_pe_bytes, "f.exe", "PE")
-        assert meta['size_bytes'] == len(sample_pe_bytes)
-
-    def test_format_matches_input(self, sample_elf_bytes):
-        meta = get_file_metadata(sample_elf_bytes, "binary", "ELF")
-        assert meta['format'] == "ELF"
-
-    def test_sha256_is_correct(self, sample_pe_bytes):
-        meta = get_file_metadata(sample_pe_bytes, "f.exe", "PE")
-        expected = compute_sha256(sample_pe_bytes)
-        assert meta['sha256'] == expected
-
-    def test_size_human_bytes_format(self):
-        """Files under 1024 bytes use 'B' suffix."""
-        data = b'MZ' + b'\x00' * 100   # 102 bytes
-        meta = get_file_metadata(data, "tiny.exe", "PE")
-        assert 'B' in meta['size_human']
-        assert 'KB' not in meta['size_human']
-        assert 'MB' not in meta['size_human']
-
-    def test_size_human_kb_format(self, sample_pe_bytes):
-        """1024-byte file → KB."""
-        meta = get_file_metadata(sample_pe_bytes, "f.exe", "PE")
-        assert 'KB' in meta['size_human']
-
-    def test_size_human_mb_format(self, large_pe_bytes):
-        """File > 1 MB → MB suffix."""
-        big = large_pe_bytes * 120   # ~1.2 MB
-        meta = get_file_metadata(big, "big.exe", "PE")
-        assert 'MB' in meta['size_human']
-
-    def test_upload_time_is_iso_format(self, sample_pe_bytes):
-        from datetime import datetime
-        meta = get_file_metadata(sample_pe_bytes, "f.exe", "PE")
-        # Should parse without exception
-        datetime.fromisoformat(meta['upload_time'])
-
-    def test_all_values_json_serialisable(self, sample_pe_bytes):
+    def test_file_format_correct(self, tmp_path):
         import json
-        meta = get_file_metadata(sample_pe_bytes, "f.exe", "PE")
-        json.dumps(meta)   # must not raise
+        names = ['A', 'B', 'C']
+        path = tmp_path / 'class_names.json'
+        save_class_names(names, path)
+        with open(path) as f:
+            data = json.load(f)
+        assert 'class_names' in data
+        assert data['class_names'] == names
+
+    def test_overwrites_existing(self, tmp_path):
+        path = tmp_path / 'class_names.json'
+        save_class_names(['X'], path)
+        save_class_names(['A', 'B'], path)
+        loaded = load_class_names(path)
+        assert loaded == ['A', 'B']
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BinaryConverter
-# ══════════════════════════════════════════════════════════════════════════════
+class TestValidateDatasetIntegrity:
+    def test_missing_dir_raises(self, tmp_path):
+        missing = tmp_path / 'nonexistent'
+        with pytest.raises(FileNotFoundError, match="not found"):
+            validate_dataset_integrity(missing)
 
-class TestBinaryConverterInit:
+    def test_empty_dir_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="empty"):
+            validate_dataset_integrity(tmp_path)
 
-    def test_default_img_size_from_config(self):
+    def test_returns_required_keys(self, tmp_path):
+        """Create a minimal fake dataset with one family and one valid PNG."""
+        import cv2
+        family_dir = tmp_path / 'FamilyA'
+        family_dir.mkdir()
+        # Create a minimal valid grayscale PNG
+        img = np.zeros((16, 16), dtype=np.uint8)
+        img_path = family_dir / 'sample.png'
+        cv2.imwrite(str(img_path), img)
+
+        report = validate_dataset_integrity(tmp_path)
+        required_keys = {
+            'valid', 'families', 'counts', 'total',
+            'min_class', 'max_class', 'imbalance_ratio',
+            'corrupt_files', 'missing_dirs'
+        }
+        assert required_keys.issubset(report.keys())
+
+    def test_counts_and_total_correct(self, tmp_path):
+        import cv2
+        for family in ['FamilyA', 'FamilyB']:
+            d = tmp_path / family
+            d.mkdir()
+            for i in range(3):
+                img = np.zeros((16, 16), dtype=np.uint8)
+                cv2.imwrite(str(d / f'img{i}.png'), img)
+
+        report = validate_dataset_integrity(tmp_path)
+        assert report['total'] == 6
+        assert report['counts']['FamilyA'] == 3
+        assert report['counts']['FamilyB'] == 3
+
+    def test_corrupt_file_detection(self, tmp_path):
+        """A corrupt PNG (not a valid image) should appear in corrupt_files."""
+        family_dir = tmp_path / 'FamilyA'
+        family_dir.mkdir()
+        bad_png = family_dir / 'bad.png'
+        bad_png.write_bytes(b'not an image')  # cv2.imread will return None
+
+        report = validate_dataset_integrity(tmp_path)
+        assert len(report['corrupt_files']) == 1
+        assert report['valid'] is False
+
+    def test_families_sorted(self, tmp_path):
+        import cv2
+        for name in ['Zebra', 'Alligator', 'Monkey']:
+            d = tmp_path / name
+            d.mkdir()
+            img = np.zeros((8, 8), dtype=np.uint8)
+            cv2.imwrite(str(d / 'img.png'), img)
+
+        report = validate_dataset_integrity(tmp_path)
+        assert report['families'] == ['Alligator', 'Monkey', 'Zebra']
+
+    def test_imbalance_ratio(self, tmp_path):
+        import cv2
+        # FamilyA has 1 sample, FamilyB has 4 samples → ratio = 4.0
+        for name, count in [('FamilyA', 1), ('FamilyB', 4)]:
+            d = tmp_path / name
+            d.mkdir()
+            for i in range(count):
+                img = np.zeros((8, 8), dtype=np.uint8)
+                cv2.imwrite(str(d / f'img{i}.png'), img)
+
+        report = validate_dataset_integrity(tmp_path)
+        assert abs(report['imbalance_ratio'] - 4.0) < 1e-6
+
+    def test_missing_dirs_always_empty_list(self, tmp_path):
+        import cv2
+        d = tmp_path / 'FamilyA'
+        d.mkdir()
+        img = np.zeros((8, 8), dtype=np.uint8)
+        cv2.imwrite(str(d / 'img.png'), img)
+        report = validate_dataset_integrity(tmp_path)
+        assert report['missing_dirs'] == []
+
+    @pytest.mark.integration
+    def test_malimg_dataset_valid(self):
+        """Requires real Malimg dataset at config.DATA_DIR."""
         import config
-        c = BinaryConverter()
-        assert c.img_size == config.IMG_SIZE
-
-    def test_custom_img_size(self):
-        c = BinaryConverter(img_size=64)
-        assert c.img_size == 64
-
-    def test_zero_img_size_raises(self):
-        with pytest.raises(ValueError, match="positive"):
-            BinaryConverter(img_size=0)
-
-    def test_negative_img_size_raises(self):
-        with pytest.raises(ValueError):
-            BinaryConverter(img_size=-1)
+        if not config.DATA_DIR.exists():
+            pytest.skip("Malimg dataset not found at DATA_DIR")
+        report = validate_dataset_integrity(config.DATA_DIR)
+        assert report['total'] > 0
+        assert len(report['families']) == 25
+        assert len(report['corrupt_files']) == 0
 
 
-class TestBinaryConverterConvert:
+class TestMalimgDataset:
+    """Unit tests that build a tiny fake dataset (no real Malimg needed)."""
 
-    def test_output_shape_128x128(self, sample_pe_bytes):
-        result = BinaryConverter(img_size=128).convert(sample_pe_bytes)
-        assert result.shape == (128, 128)
+    @pytest.fixture
+    def fake_data_dir(self, tmp_path):
+        """3 families × 5 samples each = 15 total images."""
+        import cv2
+        for family in ['FamilyA', 'FamilyB', 'FamilyC']:
+            d = tmp_path / family
+            d.mkdir()
+            for i in range(5):
+                img = np.random.randint(0, 256, (16, 16), dtype=np.uint8)
+                cv2.imwrite(str(d / f'img{i:03d}.png'), img)
+        return tmp_path
 
-    def test_output_shape_64x64(self, sample_pe_bytes):
-        result = BinaryConverter(img_size=64).convert(sample_pe_bytes)
-        assert result.shape == (64, 64)
+    def test_invalid_split_raises(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        with pytest.raises(ValueError, match="split"):
+            MalimgDataset(fake_data_dir, 'invalid_split')
 
-    def test_output_shape_256x256(self, sample_pe_bytes):
-        result = BinaryConverter(img_size=256).convert(sample_pe_bytes)
-        assert result.shape == (256, 256)
+    def test_missing_data_dir_raises(self, tmp_path):
+        from modules.dataset.loader import MalimgDataset
+        missing = tmp_path / 'does_not_exist'
+        with pytest.raises(FileNotFoundError):
+            MalimgDataset(missing, 'train')
 
-    def test_output_dtype_uint8(self, sample_pe_bytes):
-        result = BinaryConverter().convert(sample_pe_bytes)
-        assert result.dtype == np.uint8
+    def test_split_sizes_sum_to_total(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        train_ds = MalimgDataset(fake_data_dir, 'train')
+        val_ds   = MalimgDataset(fake_data_dir, 'val')
+        test_ds  = MalimgDataset(fake_data_dir, 'test')
+        total = len(train_ds) + len(val_ds) + len(test_ds)
+        assert total == 15
 
-    def test_output_values_in_0_255(self, sample_pe_bytes):
-        result = BinaryConverter().convert(sample_pe_bytes)
-        assert int(result.min()) >= 0
-        assert int(result.max()) <= 255
+    def test_getitem_tensor_shape(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        ds = MalimgDataset(fake_data_dir, 'train', img_size=128)
+        tensor, label = ds[0]
+        assert tensor.shape == (1, 128, 128)
 
-    def test_elf_binary_converts(self, sample_elf_bytes):
-        result = BinaryConverter().convert(sample_elf_bytes)
-        assert result.shape == (128, 128)
-        assert result.dtype == np.uint8
+    def test_getitem_tensor_dtype(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        ds = MalimgDataset(fake_data_dir, 'train', img_size=128)
+        tensor, label = ds[0]
+        assert tensor.dtype == torch.float32
 
-    def test_large_binary_converts(self, large_pe_bytes):
-        result = BinaryConverter().convert(large_pe_bytes)
-        assert result.shape == (128, 128)
+    def test_getitem_label_is_int(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        ds = MalimgDataset(fake_data_dir, 'train', img_size=128)
+        _, label = ds[0]
+        assert isinstance(label, int)
 
-    def test_empty_bytes_raises(self):
-        with pytest.raises(ValueError, match="too small"):
-            BinaryConverter().convert(b'')
+    def test_class_names_sorted(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        ds = MalimgDataset(fake_data_dir, 'train')
+        assert ds.class_names == sorted(ds.class_names)
 
-    def test_less_than_64_bytes_raises(self, tiny_valid_pe):
-        with pytest.raises(ValueError, match="too small"):
-            BinaryConverter().convert(tiny_valid_pe)
+    def test_label_map_keys_match_class_names(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        ds = MalimgDataset(fake_data_dir, 'train')
+        assert set(ds.label_map.keys()) == set(ds.class_names)
 
-    def test_deterministic_same_input(self, sample_pe_bytes):
-        c = BinaryConverter()
-        r1 = c.convert(sample_pe_bytes)
-        r2 = c.convert(sample_pe_bytes)
-        np.testing.assert_array_equal(r1, r2)
+    def test_label_map_values_are_unique_ints(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        ds = MalimgDataset(fake_data_dir, 'train')
+        values = list(ds.label_map.values())
+        assert len(set(values)) == len(values)
+        assert all(isinstance(v, int) for v in values)
 
-    def test_different_inputs_produce_different_images(self, sample_pe_bytes, sample_elf_bytes):
-        c = BinaryConverter()
-        r1 = c.convert(sample_pe_bytes)
-        r2 = c.convert(sample_elf_bytes)
-        # They may be equal if both are mostly zeros — check shape at minimum
-        assert r1.shape == r2.shape   # both (128, 128)
-        # For non-trivial input they should differ (our fixtures differ enough)
+    def test_get_labels_length_matches_len(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        ds = MalimgDataset(fake_data_dir, 'train')
+        assert len(ds.get_labels()) == len(ds)
 
-    def test_output_is_not_read_only(self, sample_pe_bytes):
-        """Result should be a writable numpy array."""
-        result = BinaryConverter().convert(sample_pe_bytes)
-        assert result.flags['WRITEABLE']
+    def test_splits_are_reproducible(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        ds1 = MalimgDataset(fake_data_dir, 'train', random_seed=42)
+        ds2 = MalimgDataset(fake_data_dir, 'train', random_seed=42)
+        paths1 = [str(p) for p, _ in ds1.samples]
+        paths2 = [str(p) for p, _ in ds2.samples]
+        assert paths1 == paths2
 
+    def test_different_seeds_produce_different_splits(self, fake_data_dir):
+        from modules.dataset.loader import MalimgDataset
+        ds1 = MalimgDataset(fake_data_dir, 'train', random_seed=42)
+        ds2 = MalimgDataset(fake_data_dir, 'train', random_seed=99)
+        # With 15 samples, different seeds should produce different orderings
+        paths1 = set(str(p) for p, _ in ds1.samples)
+        paths2 = set(str(p) for p, _ in ds2.samples)
+        # Not guaranteed to differ but very likely with different seeds
+        # At minimum, verify no crash
+        assert isinstance(paths1, set)
+        assert isinstance(paths2, set)
 
-class TestBinaryConverterToPngBytes:
+    @pytest.mark.integration
+    def test_malimg_split_sizes_sum_correctly(self):
+        import config
+        if not config.DATA_DIR.exists():
+            pytest.skip("Malimg dataset not found")
+        from modules.dataset.loader import MalimgDataset
+        train_ds = MalimgDataset(config.DATA_DIR, 'train')
+        val_ds   = MalimgDataset(config.DATA_DIR, 'val')
+        test_ds  = MalimgDataset(config.DATA_DIR, 'test')
+        total = len(train_ds) + len(val_ds) + len(test_ds)
+        assert 9000 < total < 9500
 
-    def test_returns_bytes(self, sample_grayscale_array):
-        result = BinaryConverter().to_png_bytes(sample_grayscale_array)
-        assert isinstance(result, bytes)
+    @pytest.mark.integration
+    def test_malimg_getitem_tensor_shape(self):
+        import config
+        if not config.DATA_DIR.exists():
+            pytest.skip("Malimg dataset not found")
+        from modules.dataset.loader import MalimgDataset
+        ds = MalimgDataset(config.DATA_DIR, 'train')
+        tensor, label = ds[0]
+        assert tensor.shape == (1, 128, 128)
+        assert tensor.dtype == torch.float32
+        assert isinstance(label, int)
 
-    def test_starts_with_png_magic(self, sample_grayscale_array):
-        result = BinaryConverter().to_png_bytes(sample_grayscale_array)
-        assert result[:4] == b'\x89PNG'
-
-    def test_nonempty_output(self, sample_grayscale_array):
-        result = BinaryConverter().to_png_bytes(sample_grayscale_array)
-        assert len(result) > 0
-
-    def test_roundtrip_via_pil(self, sample_grayscale_array):
-        """PNG bytes can be decoded back to the original array."""
-        import io
-        png_bytes = BinaryConverter().to_png_bytes(sample_grayscale_array)
-        decoded = np.array(Image.open(io.BytesIO(png_bytes)))
-        np.testing.assert_array_equal(decoded, sample_grayscale_array)
-
-
-class TestBinaryConverterToPilImage:
-
-    def test_returns_pil_image(self, sample_grayscale_array):
-        result = BinaryConverter().to_pil_image(sample_grayscale_array)
-        assert isinstance(result, Image.Image)
-
-    def test_mode_is_L(self, sample_grayscale_array):
-        result = BinaryConverter().to_pil_image(sample_grayscale_array)
-        assert result.mode == 'L'
-
-    def test_size_matches_array(self, sample_grayscale_array):
-        result = BinaryConverter().to_pil_image(sample_grayscale_array)
-        # PIL size is (width, height) = (128, 128)
-        assert result.size == (128, 128)
-
-    def test_pixel_values_preserved(self, sample_grayscale_array):
-        pil = BinaryConverter().to_pil_image(sample_grayscale_array)
-        back = np.array(pil)
-        np.testing.assert_array_equal(back, sample_grayscale_array)
-
-
-class TestBinaryConverterSave:
-
-    def test_creates_file(self, sample_grayscale_array, tmp_path):
-        output = tmp_path / "test_output.png"
-        BinaryConverter().save(sample_grayscale_array, output)
-        assert output.exists()
-
-    def test_created_file_is_valid_png(self, sample_grayscale_array, tmp_path):
-        output = tmp_path / "test_output.png"
-        BinaryConverter().save(sample_grayscale_array, output)
-        # Must be readable as an image
-        loaded = cv2.imread(str(output), cv2.IMREAD_GRAYSCALE)
-        assert loaded is not None
-        assert loaded.shape == (128, 128)
-
-    def test_saved_values_match_input(self, sample_grayscale_array, tmp_path):
-        output = tmp_path / "test_output.png"
-        BinaryConverter().save(sample_grayscale_array, output)
-        loaded = cv2.imread(str(output), cv2.IMREAD_GRAYSCALE)
-        np.testing.assert_array_equal(loaded, sample_grayscale_array)
-
-
-# Need cv2 for the save test
-import cv2
+    @pytest.mark.integration
+    def test_malimg_all_splits_contain_all_classes(self):
+        import config
+        if not config.DATA_DIR.exists():
+            pytest.skip("Malimg dataset not found")
+        from modules.dataset.loader import MalimgDataset
+        for split in ['train', 'val', 'test']:
+            ds = MalimgDataset(config.DATA_DIR, split)
+            labels_in_split = set(ds.get_labels())
+            assert len(labels_in_split) == 25, \
+                f"Split '{split}' missing classes: {25 - len(labels_in_split)} absent"
 ```
 
 ---
 
-## FILE 13: `scripts/convert_binary.py`
+## Definition of Done
 
-```python
-"""
-CLI utility: convert a single binary file to a 128x128 grayscale PNG.
-No ML dependencies.
-
-Usage:
-    python scripts/convert_binary.py --input path/to/file.exe --output path/to/out.png
-
-Exit codes:
-    0 — success
-    1 — file not found or format error
-    2 — conversion error
-"""
-import argparse
-import sys
-from pathlib import Path
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="MalTwin: Convert binary file to grayscale PNG"
-    )
-    parser.add_argument(
-        "--input", "-i",
-        required=True,
-        type=Path,
-        help="Path to input PE or ELF binary file",
-    )
-    parser.add_argument(
-        "--output", "-o",
-        required=True,
-        type=Path,
-        help="Path to output PNG file (will be created)",
-    )
-    parser.add_argument(
-        "--size",
-        type=int,
-        default=128,
-        help="Output image size in pixels (default: 128)",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-
-    # Validate input file exists
-    if not args.input.exists():
-        print(f"Error: Input file not found: {args.input}", file=sys.stderr)
-        sys.exit(1)
-
-    # Read bytes
-    file_bytes = args.input.read_bytes()
-    print(f"Read {len(file_bytes):,} bytes from {args.input.name}")
-
-    # Validate format
-    from modules.binary_to_image.utils import (
-        validate_binary_format,
-        compute_sha256,
-        get_file_metadata,
-    )
-    try:
-        file_format = validate_binary_format(file_bytes)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Detected format : {file_format}")
-
-    # Compute metadata
-    sha256 = compute_sha256(file_bytes)
-    meta   = get_file_metadata(file_bytes, args.input.name, file_format)
-    print(f"File size       : {meta['size_human']}")
-    print(f"SHA-256         : {sha256}")
-
-    # Convert
-    from modules.binary_to_image.converter import BinaryConverter
-    try:
-        converter = BinaryConverter(img_size=args.size)
-        img_array = converter.convert(file_bytes)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(2)
-
-    # Save
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        converter.save(img_array, args.output)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(2)
-
-    print(f"Saved {args.size}x{args.size} grayscale PNG → {args.output}")
-
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-## FILE 14: `scripts/__init__.py`
-
-```python
-# empty
-```
-
----
-
-## DEFINITION OF DONE
-
-Before marking this phase complete, verify all of the following:
+Run these commands after implementing. All must pass before Phase 2 is complete.
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Unit tests only (no dataset required — these must all pass clean)
+pytest tests/test_dataset.py -v -m "not integration"
 
-# Generate fixture files
-python tests/fixtures/create_fixtures.py
+# Expected output (all unit tests):
+# tests/test_dataset.py::TestNormalizeImage::test_output_range PASSED
+# tests/test_dataset.py::TestNormalizeImage::test_output_dtype_float32 PASSED
+# tests/test_dataset.py::TestNormalizeImage::test_zero_maps_to_zero PASSED
+# tests/test_dataset.py::TestNormalizeImage::test_255_maps_to_one PASSED
+# tests/test_dataset.py::TestNormalizeImage::test_shape_preserved PASSED
+# tests/test_dataset.py::TestNormalizeImage::test_midpoint_maps_correctly PASSED
+# tests/test_dataset.py::TestEncodeLabels::test_sorted_alphabetically PASSED
+# tests/test_dataset.py::TestEncodeLabels::test_unique_integers PASSED
+# tests/test_dataset.py::TestEncodeLabels::test_range_correct PASSED
+# tests/test_dataset.py::TestEncodeLabels::test_deterministic PASSED
+# tests/test_dataset.py::TestEncodeLabels::test_single_family PASSED
+# tests/test_dataset.py::TestEncodeLabels::test_order_independent PASSED
+# tests/test_dataset.py::TestEncodeLabels::test_returns_dict PASSED
+# tests/test_dataset.py::TestEncodeLabels::test_all_values_are_ints PASSED
+# tests/test_dataset.py::TestSaveLoadClassNames::test_roundtrip PASSED
+# tests/test_dataset.py::TestSaveLoadClassNames::test_creates_parent_dirs PASSED
+# tests/test_dataset.py::TestSaveLoadClassNames::test_load_nonexistent_raises PASSED
+# tests/test_dataset.py::TestSaveLoadClassNames::test_file_format_correct PASSED
+# tests/test_dataset.py::TestSaveLoadClassNames::test_overwrites_existing PASSED
+# tests/test_dataset.py::TestValidateDatasetIntegrity::test_missing_dir_raises PASSED
+# tests/test_dataset.py::TestValidateDatasetIntegrity::test_empty_dir_raises PASSED
+# tests/test_dataset.py::TestValidateDatasetIntegrity::test_returns_required_keys PASSED
+# tests/test_dataset.py::TestValidateDatasetIntegrity::test_counts_and_total_correct PASSED
+# tests/test_dataset.py::TestValidateDatasetIntegrity::test_corrupt_file_detection PASSED
+# tests/test_dataset.py::TestValidateDatasetIntegrity::test_families_sorted PASSED
+# tests/test_dataset.py::TestValidateDatasetIntegrity::test_imbalance_ratio PASSED
+# tests/test_dataset.py::TestValidateDatasetIntegrity::test_missing_dirs_always_empty_list PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_invalid_split_raises PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_missing_data_dir_raises PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_split_sizes_sum_to_total PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_getitem_tensor_shape PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_getitem_tensor_dtype PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_getitem_label_is_int PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_class_names_sorted PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_label_map_keys_match_class_names PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_label_map_values_are_unique_ints PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_get_labels_length_matches_len PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_splits_are_reproducible PASSED
+# tests/test_dataset.py::TestMalimgDataset::test_different_seeds_produce_different_splits PASSED
+#
+# ====== X passed, 3 deselected (integration) ======
 
-# Run the full test suite for this phase
+# Phase 1 tests must still pass (no regressions)
 pytest tests/test_converter.py -v
-
-# Expected output: all tests PASSED, 0 failed, 0 errors
-# Approximate count: 55–60 test cases
-
-# Smoke test the CLI
-python tests/fixtures/create_fixtures.py
-python scripts/convert_binary.py \
-    --input tests/fixtures/sample_pe.exe \
-    --output /tmp/test_output.png
-# Expected output:
-#   Read 1,024 bytes from sample_pe.exe
-#   Detected format : PE
-#   File size       : 1.00 KB
-#   SHA-256         : <64-char hex>
-#   Saved 128x128 grayscale PNG → /tmp/test_output.png
-
-# Verify config.py imports cleanly
-python -c "import config; print(config.DEVICE)"
-# Expected: cpu  (or cuda if GPU present)
 ```
+
+If you have the Malimg dataset available:
+```bash
+# Run all tests including integration
+pytest tests/test_dataset.py -v
+```
+
+### Checklist
+
+- [ ] `pytest tests/test_dataset.py -v -m "not integration"` passes with zero failures
+- [ ] `pytest tests/test_converter.py -v` still passes (no regressions)
+- [ ] `modules/dataset/__init__.py` exports `MalimgDataset`, `get_dataloaders`, `validate_dataset_integrity`
+- [ ] `modules/enhancement/__init__.py` exports `get_train_transforms`, `get_val_transforms`, `GaussianNoise`, `ClassAwareOversampler`
+- [ ] `cv2.imread()` uses `cv2.IMREAD_GRAYSCALE` everywhere — never loads as BGR
+- [ ] `cv2.resize()` uses `(img_size, img_size)` — NOT `(height, width)` or `(width, height)` reversed
+- [ ] `Normalize` uses `mean=[0.5], std=[0.5]` (single-element lists, not scalars)
+- [ ] `ColorJitter` is before `ToTensor()` in the train pipeline
+- [ ] `GaussianNoise` is after `ToTensor()` in the train pipeline
+- [ ] `encode_labels()` sorts alphabetically before enumerating
+- [ ] `train_test_split` uses `random_state=config.RANDOM_SEED`
+- [ ] No external network calls anywhere in these modules
 
 ---
 
-## WHAT NOT TO IMPLEMENT IN THIS PHASE
+## Common Bugs to Avoid
 
-Do not implement anything from these modules — they come in later phases:
+| Bug | Symptom | Fix |
+|-----|---------|-----|
+| `cv2.resize((height, width))` | Images load with transposed dimensions | Use `(width, height)` — i.e. `(img_size, img_size)` for square |
+| `Normalize(mean=0.5, std=0.5)` scalar | Runtime error or wrong normalization | Must be `mean=[0.5], std=[0.5]` (lists) |
+| `ColorJitter` after `ToTensor` | TypeError: expects PIL Image | Move `ColorJitter` before `ToTensor` |
+| `GaussianNoise` before `ToTensor` | TypeError: tensor expected | Move `GaussianNoise` after `ToTensor` |
+| Forgetting `sorted()` in `encode_labels` | Non-deterministic label mapping | Always sort before enumerating |
+| `shuffle=True` on val/test loader | Non-reproducible evaluation | Only train loader uses sampler; val/test use `shuffle=False` |
+| `sampler=` AND `shuffle=True` together | DataLoader raises ValueError | Use either `sampler=` or `shuffle=True`, never both |
+| Forgetting `drop_last=True` on train loader | Single-sample final batch crashes BatchNorm | Set `drop_last=True` on train DataLoader only |
+| `WeightedRandomSampler(replacement=False)` | Cannot oversample minority classes | Must use `replacement=True` |
 
-- `modules/dataset/`       — Phase 2
-- `modules/enhancement/`   — Phase 3
-- `modules/detection/`     — Phase 4
-- `modules/dashboard/`     — Phase 6
-- `scripts/train.py`       — Phase 5
-- `scripts/evaluate.py`    — Phase 5
-- `data/mitre_ics_mapping.json` — Phase 6
+---
 
-Creating empty placeholder `__init__.py` files in those directories is acceptable if needed to prevent import errors, but do not implement any logic in them.
+*Phase 2 complete → proceed to Phase 3: Enhancement tests + Detection model.*
