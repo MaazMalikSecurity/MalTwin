@@ -17,7 +17,7 @@ def load_model(model_path: Path, num_classes: int, device: torch.device) -> MalT
         raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
 
     model = MalTwinCNN(num_classes=num_classes)
-    state = torch.load(model_path, map_location=device)
+    state = torch.load(model_path, map_location=device, weights_only=True)
     # Handle both raw state_dict and checkpoint dicts
     if isinstance(state, dict) and "model_state" in state:
         model.load_state_dict(state["model_state"])
