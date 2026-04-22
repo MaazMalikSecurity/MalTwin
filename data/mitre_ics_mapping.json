@@ -1,0 +1,69 @@
+{
+  "Allaple.A": {
+    "tactics": ["Lateral Movement", "Impact"],
+    "techniques": [
+      {"id": "T0812", "name": "Default Credentials"},
+      {"id": "T0882", "name": "Theft of Operational Information"}
+    ]
+  },
+  "Allaple.L": {
+    "tactics": ["Lateral Movement", "Discovery"],
+    "techniques": [
+      {"id": "T0846", "name": "Remote System Discovery"},
+      {"id": "T0812", "name": "Default Credentials"}
+    ]
+  },
+  "Yuner.A": {
+    "tactics": ["Execution", "Persistence"],
+    "techniques": [
+      {"id": "T0807", "name": "Command-Line Interface"},
+      {"id": "T0839", "name": "Module Firmware"}
+    ]
+  },
+  "Instantaccess": {
+    "tactics": ["Collection"],
+    "techniques": [
+      {"id": "T0802", "name": "Automated Collection"}
+    ]
+  },
+  "Swizzor.gen!E": {
+    "tactics": ["Defense Evasion"],
+    "techniques": [
+      {"id": "T0858", "name": "Change Operating Mode"}
+    ]
+  },
+  "VB.AT": {
+    "tactics": ["Execution"],
+    "techniques": [
+      {"id": "T0871", "name": "Execution through API"}
+    ]
+  },
+  "Obfuscator.AD": {
+    "tactics": ["Defense Evasion"],
+    "techniques": [
+      {"id": "T0858", "name": "Change Operating Mode"},
+      {"id": "T0849", "name": "Masquerading"}
+    ]
+  },
+  "Adialer.C": {
+    "tactics": ["Impact", "Collection"],
+    "techniques": [
+      {"id": "T0879", "name": "Damage to Property"},
+      {"id": "T0802", "name": "Automated Collection"}
+    ]
+  },
+  "Rbot!gen": {
+    "tactics": ["Command and Control", "Lateral Movement"],
+    "techniques": [
+      {"id": "T0869", "name": "Standard Application Layer Protocol"},
+      {"id": "T0812", "name": "Default Credentials"}
+    ]
+  },
+  "Skintrim.N": {
+    "tactics": ["Collection", "Exfiltration"],
+    "techniques": [
+      {"id": "T0802", "name": "Automated Collection"},
+      {"id": "T0830", "name": "Adversary-in-the-Middle"}
+    ]
+  }
+}
