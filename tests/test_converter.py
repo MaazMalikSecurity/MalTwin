@@ -5,6 +5,7 @@ Run: pytest tests/test_converter.py -v
 """
 import hashlib
 
+import cv2
 import numpy as np
 import pytest
 from PIL import Image
@@ -368,7 +369,3 @@ class TestBinaryConverterSave:
         BinaryConverter().save(sample_grayscale_array, output)
         loaded = cv2.imread(str(output), cv2.IMREAD_GRAYSCALE)
         np.testing.assert_array_equal(loaded, sample_grayscale_array)
-
-
-# Need cv2 for the save test
-import cv2
