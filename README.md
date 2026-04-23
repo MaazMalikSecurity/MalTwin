@@ -1,1185 +1,648 @@
-# MalTwin — Phase 4: Detection Module
-### Agent Instruction Document | `modules/detection/` + `tests/test_model.py`
+# MalTwin — Phase 5: CLI Scripts
+### Agent Instruction Document | `scripts/train.py` + `scripts/evaluate.py` + `scripts/convert_binary.py`
 
 > **Read this entire document before writing a single line of code.**
-> Every class, method, signature, and behavioral rule is fully specified.
-> Do not infer, guess, or deviate from what is written here.
+> All three scripts are fully specified here. Do not add argparse flags, imports,
+> print statements, or error handling that is not listed below.
 
 ---
 
 ## Mandatory Rules (from PRD Section 16)
 
-These are the most commonly hallucinated bugs. Violating any of them causes test failures or silent training errors.
-
 - **Read `MALTWIN_PRD_COMPLETE.md`** before writing any code.
-- All CNN tensors are **single-channel**: shape `(batch, 1, H, W)`. NEVER `(batch, 3, H, W)`.
-- `CrossEntropyLoss` expects **raw logits** — do NOT apply softmax inside `model.forward()`.
-- `model.eval()` and `torch.no_grad()` are **always paired** during inference and validation.
-- `torch.manual_seed(42)` is called at the **start of `train()`**, not at module level.
-- Use `weights_only=True` in `torch.load()` for PyTorch 2.x security.
-- `bias=False` in Conv2d when followed by BatchNorm (eliminates redundant parameters).
-- `drop_last=True` in train DataLoader to prevent single-sample batches breaking BatchNorm.
-- `self.gradcam_layer = self.block3.conv2` **must be set** in `MalTwinCNN.__init__`.
-  Agents forget this constantly even when it is in the spec. The test will catch it.
-- `matplotlib.use('Agg')` must be at the **module level** of `evaluator.py` (before any plt calls).
-- `plt.close(fig)` is **mandatory** after saving — prevents memory leaks.
-- `get_val_transforms` is used inside `predict_single` — NEVER `get_train_transforms`.
-- All paths use `pathlib.Path`, never string concatenation.
+- Scripts are in the `scripts/` directory at the repo root, **not** inside `modules/`.
+- All scripts must be runnable as `python scripts/<name>.py` from the repo root.
+- All paths constructed in scripts must use `pathlib.Path`, never string concatenation.
+- No script may import from another script — only from `modules/` and `config`.
+- `torch.manual_seed()` and `np.random.seed()` are called **at the top of `main()`**, before any data loading.
+- Exit codes must be exact: `sys.exit(0)` on success, `sys.exit(1)` for dataset errors, `sys.exit(2)` for training errors.
+- Scripts must have no side effects at import time (all logic inside `if __name__ == '__main__': main()`).
+- `argparse` is the only CLI parsing library permitted — no `click`, no `typer`.
 
 ---
 
-## Phase 4 Scope
+## Phase 5 Scope
 
-Phase 4 implements the full detection module: model architecture, training loop, evaluation, and inference. It depends on Phases 1–3 (binary_to_image, dataset, enhancement must already exist).
+Phase 5 implements the three CLI scripts that orchestrate the full ML pipeline. They depend on Phases 1–4 being complete and correct.
 
 ### Files to create
 
 | File | Description |
 |------|-------------|
-| `modules/detection/__init__.py` | Package exports |
-| `modules/detection/model.py` | `ConvBlock`, `MalTwinCNN` |
-| `modules/detection/trainer.py` | `train()`, `validate_epoch()` |
-| `modules/detection/evaluator.py` | `evaluate()`, `plot_confusion_matrix()`, `format_metrics_table()` |
-| `modules/detection/inference.py` | `load_model()`, `predict_single()`, `predict_batch()` |
-| `tests/test_model.py` | Full test suite (exactly as specified below) |
+| `scripts/__init__.py` | Empty file (makes scripts importable for import-error smoke tests) |
+| `scripts/train.py` | Full training pipeline: validate → dataloaders → model → train → evaluate → save outputs |
+| `scripts/evaluate.py` | Test-set evaluation only: load model → build test loader → evaluate → print metrics |
+| `scripts/convert_binary.py` | Single-file binary-to-image conversion: validate → hash → convert → save PNG |
 
 ---
 
-## File 1: `modules/detection/__init__.py`
+## File 1: `scripts/__init__.py`
 
 ```python
-# modules/detection/__init__.py
-from .model import MalTwinCNN
-from .trainer import train
-from .evaluator import evaluate
-from .inference import load_model, predict_single
+# scripts/__init__.py
+# Empty — allows `python -c "import scripts.train"` import smoke tests.
 ```
 
 ---
 
-## File 2: `modules/detection/model.py`
+## File 2: `scripts/train.py`
 
 ```python
-# modules/detection/model.py
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-class ConvBlock(nn.Module):
-    """
-    Reusable convolutional block:
-        Conv2d → BatchNorm → ReLU → Conv2d → BatchNorm → ReLU → MaxPool2d → Dropout2d
-
-    Constructor args:
-        in_channels  (int):   input channels
-        out_channels (int):   output channels for BOTH Conv layers
-        dropout_p    (float): Dropout2d probability, default 0.25
-
-    bias=False in all Conv2d because BatchNorm follows immediately.
-    """
-
-    def __init__(self, in_channels: int, out_channels: int, dropout_p: float = 0.25):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(out_channels)
-        self.pool  = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.drop  = nn.Dropout2d(p=dropout_p)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.pool(x)
-        x = self.drop(x)
-        return x
-
-
-class MalTwinCNN(nn.Module):
-    """
-    Three-block CNN for grayscale malware image classification.
-
-    Input:  (batch_size, 1, 128, 128)  — single-channel grayscale
-    Output: (batch_size, num_classes)  — raw logits (NO softmax)
-
-    Architecture:
-        Input (1, 128, 128)
-            ↓
-        block1: ConvBlock(1 → 32)      → (32, 64, 64)   after MaxPool
-            ↓
-        block2: ConvBlock(32 → 64)     → (64, 32, 32)   after MaxPool
-            ↓
-        block3: ConvBlock(64 → 128)    → (128, 16, 16)  after MaxPool
-            ↓                            ← self.gradcam_layer = self.block3.conv2
-        pool:   AdaptiveAvgPool2d(4,4) → (128, 4, 4)
-            ↓
-        flatten                        → (2048,)
-            ↓
-        classifier:
-            Linear(2048 → 512)
-            ReLU
-            Dropout(p=0.5)
-            Linear(512 → num_classes)
-            ↓
-        raw logits (num_classes,)
-
-    CRITICAL:
-        self.gradcam_layer = self.block3.conv2
-        This MUST be set — it is tested explicitly.
-        It is used by Module 7 (Grad-CAM) to register backward hooks.
-    """
-
-    def __init__(self, num_classes: int):
-        super().__init__()
-        self.block1 = ConvBlock(1, 32)
-        self.block2 = ConvBlock(32, 64)
-        self.block3 = ConvBlock(64, 128)
-        self.pool   = nn.AdaptiveAvgPool2d((4, 4))
-
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 512),
-            nn.ReLU(),
-            nn.Dropout(p=0.5),
-            nn.Linear(512, num_classes),
-        )
-
-        # Grad-CAM hook target — MUST be the second conv of block3
-        self.gradcam_layer = self.block3.conv2
-
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        """
-        Kaiming normal for Conv2d, constant init for BatchNorm, Xavier for Linear.
-        """
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.pool(x)
-        x = torch.flatten(x, 1)
-        x = self.classifier(x)
-        return x  # raw logits — NO softmax here
-```
-
----
-
-## File 3: `modules/detection/trainer.py`
-
-```python
-# modules/detection/trainer.py
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from pathlib import Path
-from tqdm import tqdm
-import config
-from .model import MalTwinCNN
-
-
-def train(
-    model: MalTwinCNN,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: torch.device,
-    epochs: int = config.EPOCHS,
-    lr: float = config.LR,
-    weight_decay: float = config.WEIGHT_DECAY,
-    lr_patience: int = config.LR_PATIENCE,
-    checkpoint_dir: Path = config.CHECKPOINT_DIR,
-    best_model_path: Path = config.BEST_MODEL_PATH,
-) -> dict:
-    """
-    Full training loop with per-epoch checkpointing and LR scheduling.
-
-    Returns history dict:
-        {
-            'train_loss':   list[float],   # mean loss per epoch
-            'train_acc':    list[float],   # accuracy 0.0–1.0 per epoch
-            'val_loss':     list[float],
-            'val_acc':      list[float],
-            'best_val_acc': float,
-            'best_epoch':   int,
-        }
-
-    Optimizer:   Adam(lr=lr, weight_decay=weight_decay)
-    Loss:        CrossEntropyLoss() — expects raw logits, no softmax in model
-    Scheduler:   ReduceLROnPlateau(mode='max', factor=0.5, patience=lr_patience, min_lr=1e-6)
-                 scheduler.step(val_acc) called after each epoch.
-
-    Per-epoch:
-        1. model.train()
-        2. Iterate train_loader with tqdm (desc="Epoch NNN/NNN [Train]")
-        3. Forward → loss → backward → optimizer.step()
-        4. Accumulate correct predictions for accuracy
-        5. validate_epoch() → val_loss, val_acc
-        6. scheduler.step(val_acc)
-        7. Print epoch summary
-        8. Save checkpoint: checkpoint_dir/epoch_{N:03d}_acc{val_acc:.4f}.pt
-        9. If val_acc > best so far: save model.state_dict() to best_model_path
-
-    Reproducibility:
-        torch.manual_seed(config.RANDOM_SEED) at top of function.
-        torch.cuda.manual_seed(config.RANDOM_SEED) if CUDA.
-    """
-    # Reproducibility — seed at start of train(), not at module level
-    torch.manual_seed(config.RANDOM_SEED)
-    if device.type == 'cuda':
-        torch.cuda.manual_seed(config.RANDOM_SEED)
-
-    model = model.to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='max',
-        factor=0.5,
-        patience=lr_patience,
-        min_lr=1e-6,
-        verbose=True,
-    )
-
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    history = {
-        'train_loss':   [],
-        'train_acc':    [],
-        'val_loss':     [],
-        'val_acc':      [],
-        'best_val_acc': 0.0,
-        'best_epoch':   0,
-    }
-    best_val_acc = 0.0
-
-    for epoch in range(epochs):
-        # ── Training phase ──────────────────────────────────────────────────────
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch+1:03d}/{epochs:03d} [Train]",
-            leave=False,
-        )
-        for inputs, labels in pbar:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            batch_size = inputs.size(0)
-            running_loss += loss.item() * batch_size
-            _, predicted = outputs.max(1)
-            correct += predicted.eq(labels).sum().item()
-            total += batch_size
-
-            pbar.set_postfix({'loss': f"{running_loss/total:.4f}", 'acc': f"{correct/total:.4f}"})
-
-        train_loss = running_loss / total
-        train_acc  = correct / total
-
-        # ── Validation phase ─────────────────────────────────────────────────────
-        val_loss, val_acc = validate_epoch(model, val_loader, device, criterion)
-
-        # ── Scheduler step ───────────────────────────────────────────────────────
-        scheduler.step(val_acc)
-
-        # ── Logging ──────────────────────────────────────────────────────────────
-        history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['val_loss'].append(val_loss)
-        history['val_acc'].append(val_acc)
-
-        current_lr = optimizer.param_groups[0]['lr']
-        print(
-            f"Epoch {epoch+1:03d}/{epochs} | "
-            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | "
-            f"LR: {current_lr:.6f}"
-        )
-
-        # ── Checkpoint ────────────────────────────────────────────────────────────
-        checkpoint_path = checkpoint_dir / f"epoch_{epoch+1:03d}_acc{val_acc:.4f}.pt"
-        torch.save({
-            'epoch':           epoch + 1,
-            'model_state':     model.state_dict(),
-            'optimizer_state': optimizer.state_dict(),
-            'val_acc':         val_acc,
-            'val_loss':        val_loss,
-            'train_acc':       train_acc,
-            'train_loss':      train_loss,
-        }, checkpoint_path)
-
-        # ── Best model save ───────────────────────────────────────────────────────
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            history['best_val_acc'] = best_val_acc
-            history['best_epoch']   = epoch + 1
-            torch.save(model.state_dict(), best_model_path)
-            print(f"  ★ New best model saved (val_acc={val_acc:.4f})")
-
-    return history
-
-
-def validate_epoch(
-    model: MalTwinCNN,
-    loader: DataLoader,
-    device: torch.device,
-    criterion: nn.Module,
-) -> tuple[float, float]:
-    """
-    Run one full validation pass. Returns (avg_loss, accuracy).
-
-    model.eval() and torch.no_grad() are always used together here.
-    Loss is accumulated weighted by batch size for correctness with variable batch sizes.
-    """
-    model.eval()
-    total_loss = 0.0
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-        for inputs, labels in loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            # Multiply by batch size for correct mean across variable-size final batch
-            total_loss += loss.item() * inputs.size(0)
-            _, predicted = outputs.max(1)
-            correct += predicted.eq(labels).sum().item()
-            total += labels.size(0)
-
-    return total_loss / total, correct / total
-```
-
----
-
-## File 4: `modules/detection/evaluator.py`
-
-```python
-# modules/detection/evaluator.py
-import torch
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')   # MUST be at module level — no display required in server env
-import matplotlib.pyplot as plt
-from pathlib import Path
-from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
-    confusion_matrix,
-    classification_report,
-)
-from torch.utils.data import DataLoader
-import config
-from .model import MalTwinCNN
-
-
-def evaluate(
-    model: MalTwinCNN,
-    test_loader: DataLoader,
-    device: torch.device,
-    class_names: list[str],
-) -> dict:
-    """
-    Full evaluation on test set. Returns comprehensive metrics dict.
-
-    Returns:
-        {
-            'accuracy':              float,
-            'precision_macro':       float,
-            'recall_macro':          float,
-            'f1_macro':              float,
-            'precision_weighted':    float,
-            'recall_weighted':       float,
-            'f1_weighted':           float,
-            'confusion_matrix':      np.ndarray,   # shape (num_classes, num_classes)
-            'per_class': {
-                family_name: {
-                    'precision': float,
-                    'recall':    float,
-                    'f1':        float,
-                    'support':   int,
-                }
-            },
-            'classification_report': str,
-            'num_test_samples':      int,
-        }
-
-    Implementation:
-        1. model.eval()
-        2. Collect all predictions and true labels with torch.no_grad()
-        3. Compute all metrics using sklearn
-        4. Build per_class dict from precision_recall_fscore_support(average=None)
-    """
-    model.eval()
-    all_preds  = []
-    all_labels = []
-
-    with torch.no_grad():
-        for inputs, labels in test_loader:
-            inputs = inputs.to(device)
-            outputs = model(inputs)
-            preds = outputs.argmax(dim=1).cpu().numpy()
-            all_preds.extend(preds.tolist())
-            all_labels.extend(labels.numpy().tolist())
-
-    num_classes = len(class_names)
-
-    # Overall metrics
-    accuracy = accuracy_score(all_labels, all_preds)
-
-    prec_macro, rec_macro, f1_macro, _ = precision_recall_fscore_support(
-        all_labels, all_preds, average='macro', zero_division=0
-    )
-    prec_weighted, rec_weighted, f1_weighted, _ = precision_recall_fscore_support(
-        all_labels, all_preds, average='weighted', zero_division=0
-    )
-
-    # Per-class metrics
-    prec_per, rec_per, f1_per, support_per = precision_recall_fscore_support(
-        all_labels, all_preds, average=None,
-        labels=list(range(num_classes)), zero_division=0
-    )
-    per_class = {
-        class_names[i]: {
-            'precision': float(prec_per[i]),
-            'recall':    float(rec_per[i]),
-            'f1':        float(f1_per[i]),
-            'support':   int(support_per[i]),
-        }
-        for i in range(num_classes)
-    }
-
-    # Confusion matrix
-    cm = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
-
-    # Full classification report string
-    report = classification_report(
-        all_labels, all_preds,
-        target_names=class_names,
-        zero_division=0,
-    )
-
-    return {
-        'accuracy':              float(accuracy),
-        'precision_macro':       float(prec_macro),
-        'recall_macro':          float(rec_macro),
-        'f1_macro':              float(f1_macro),
-        'precision_weighted':    float(prec_weighted),
-        'recall_weighted':       float(rec_weighted),
-        'f1_weighted':           float(f1_weighted),
-        'confusion_matrix':      cm,
-        'per_class':             per_class,
-        'classification_report': report,
-        'num_test_samples':      len(all_labels),
-    }
-
-
-def plot_confusion_matrix(
-    cm: np.ndarray,
-    class_names: list[str],
-    output_path: Path,
-    figsize: tuple = (16, 14),
-) -> None:
-    """
-    Render and save confusion matrix as PNG.
-
-    matplotlib.use('Agg') is set at module level — never call plt.show().
-    plt.close(fig) is mandatory — prevents memory leaks in long training runs.
-    """
-    fig, ax = plt.subplots(figsize=figsize)
-    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
-    plt.colorbar(im, ax=ax)
-
-    tick_marks = np.arange(len(class_names))
-    ax.set_xticks(tick_marks)
-    ax.set_xticklabels(class_names, rotation=90, fontsize=8)
-    ax.set_yticks(tick_marks)
-    ax.set_yticklabels(class_names, fontsize=8)
-
-    # Cell annotations
-    thresh = cm.max() / 2.0
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(
-                j, i, str(cm[i, j]),
-                ha='center', va='center',
-                color='white' if cm[i, j] > thresh else 'black',
-                fontsize=6,
-            )
-
-    ax.set_ylabel('True Label', fontsize=12)
-    ax.set_xlabel('Predicted Label', fontsize=12)
-    ax.set_title('MalTwin Confusion Matrix', fontsize=14, pad=20)
-    plt.tight_layout()
-    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
-    plt.close(fig)  # MANDATORY — prevent memory leak
-
-
-def format_metrics_table(metrics: dict, class_names: list[str]) -> str:
-    """
-    Format evaluation metrics as a printable ASCII table for CLI output.
-
-    Includes overall metrics and the 5 worst per-class F1 scores.
-    """
-    width = 44
-
-    def row(label: str, value) -> str:
-        if isinstance(value, float):
-            return f"║  {label:<22} {value:.4f}          ║"
-        return f"║  {label:<22} {value:<14}║"
-
-    border_top    = '╔' + '═' * width + '╗'
-    border_mid    = '╠' + '═' * width + '╣'
-    border_bot    = '╚' + '═' * width + '╝'
-    title_line    = f"║{'MALTWIN TEST EVALUATION':^{width}}║"
-
-    lines = [
-        border_top,
-        title_line,
-        border_mid,
-        row('Accuracy:', metrics['accuracy']),
-        row('Precision (macro):', metrics['precision_macro']),
-        row('Recall (macro):', metrics['recall_macro']),
-        row('F1 (macro):', metrics['f1_macro']),
-        row('F1 (weighted):', metrics['f1_weighted']),
-        row('Test Samples:', metrics['num_test_samples']),
-        border_mid,
-        f"║{'Per-Class F1 (5 worst):':^{width}}║",
-    ]
-
-    # Sort by F1 ascending to find worst
-    per_class = metrics.get('per_class', {})
-    worst5 = sorted(per_class.items(), key=lambda kv: kv[1]['f1'])[:5]
-    for name, vals in worst5:
-        short_name = name[:20] if len(name) > 20 else name
-        lines.append(f"║    {short_name:<20} {vals['f1']:.4f}          ║")
-
-    lines.append(border_bot)
-    return '\n'.join(lines)
-```
-
----
-
-## File 5: `modules/detection/inference.py`
-
-```python
-# modules/detection/inference.py
-import torch
-import numpy as np
-from pathlib import Path
-from PIL import Image
-import config
-from .model import MalTwinCNN
-from modules.enhancement.augmentor import get_val_transforms
-
-
-def load_model(
-    model_path: Path = config.BEST_MODEL_PATH,
-    num_classes: int = config.MALIMG_EXPECTED_FAMILIES,
-    device: torch.device = config.DEVICE,
-) -> MalTwinCNN:
-    """
-    Load a trained MalTwinCNN from a .pt file containing state_dict only.
-
-    Args:
-        model_path:  path to best_model.pt
-        num_classes: must match the trained model's output layer (25 for Malimg)
-        device:      target device; handles CUDA→CPU migration automatically
-
-    Returns:
-        MalTwinCNN in eval() mode on the specified device.
-
-    Raises:
-        FileNotFoundError: if model_path does not exist.
-
-    Notes:
-        - weights_only=True is the PyTorch 2.x secure loading flag.
-        - map_location=device handles CUDA-trained models on CPU-only machines.
-    """
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Model file not found: {model_path}. "
-            "Run scripts/train.py to train the model first."
-        )
-    model = MalTwinCNN(num_classes=num_classes)
-    state_dict = torch.load(str(model_path), map_location=device, weights_only=True)
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
-    return model
-
-
-def predict_single(
-    model: MalTwinCNN,
-    img_array: np.ndarray,
-    class_names: list[str],
-    device: torch.device = config.DEVICE,
-) -> dict:
-    """
-    Run inference on a single 128×128 grayscale image array.
-
-    Args:
-        model:       MalTwinCNN instance (eval mode recommended but enforced here)
-        img_array:   numpy array shape (128, 128), dtype uint8, values 0–255
-        class_names: ordered list of family names (index = class integer)
-        device:      inference device
-
-    Returns:
-        {
-            'predicted_family': str,               # top-1 class name
-            'confidence':       float,             # top-1 softmax probability [0.0, 1.0]
-            'probabilities':    dict[str, float],  # {family: prob} for ALL classes
-            'top3': [
-                {'family': str, 'confidence': float},  # rank 1
-                {'family': str, 'confidence': float},  # rank 2
-                {'family': str, 'confidence': float},  # rank 3
-            ]
-        }
-
-    All float values are Python float (JSON-serialisable, not numpy float32).
-
-    Pipeline:
-        1. PIL Image from uint8 array (mode='L')
-        2. get_val_transforms()(pil_img) → tensor (1, 128, 128) float32
-        3. unsqueeze(0) → (1, 1, 128, 128)
-        4. model.eval() + torch.no_grad() → logits (1, num_classes)
-        5. softmax → probs (num_classes,)
-        6. argmax → top-1; argsort descending → top-3
-    """
-    # 1. PIL Image
-    pil_img = Image.fromarray(img_array, mode='L')
-
-    # 2. Val transforms (ToTensor + Normalize) — NEVER train transforms for inference
-    transform = get_val_transforms(config.IMG_SIZE)
-    tensor = transform(pil_img)            # (1, 128, 128)
-
-    # 3. Batch dimension + device
-    tensor = tensor.unsqueeze(0).to(device)  # (1, 1, 128, 128)
-
-    # 4. Forward pass
-    model.eval()
-    with torch.no_grad():
-        logits = model(tensor)             # (1, num_classes)
-
-    # 5. Softmax probabilities
-    probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-    # probs shape: (num_classes,)
-
-    # 6. Top-1
-    top1_idx        = int(np.argmax(probs))
-    top1_confidence = float(probs[top1_idx])
-    top1_family     = class_names[top1_idx]
-
-    # 7. All probabilities dict
-    prob_dict = {class_names[i]: float(probs[i]) for i in range(len(class_names))}
-
-    # 8. Top-3 (descending by confidence)
-    top3_indices = np.argsort(probs)[::-1][:3]
-    top3 = [
-        {'family': class_names[int(i)], 'confidence': float(probs[i])}
-        for i in top3_indices
-    ]
-
-    return {
-        'predicted_family': top1_family,
-        'confidence':       top1_confidence,
-        'probabilities':    prob_dict,
-        'top3':             top3,
-    }
-
-
-def predict_batch(
-    model: MalTwinCNN,
-    img_arrays: list[np.ndarray],
-    class_names: list[str],
-    device: torch.device = config.DEVICE,
-    batch_size: int = 16,
-) -> list[dict]:
-    """
-    Run inference on multiple images. Returns list of result dicts (same format as predict_single).
-
-    Processes img_arrays in chunks of batch_size to avoid OOM on CPU.
-    Results are in the same order as input.
-
-    Implementation:
-        - For each chunk: stack transforms into (B, 1, 128, 128), forward, softmax.
-        - Decompose back into per-image dicts.
-    """
-    transform = get_val_transforms(config.IMG_SIZE)
-    results = []
-
-    model.eval()
-    with torch.no_grad():
-        for chunk_start in range(0, len(img_arrays), batch_size):
-            chunk = img_arrays[chunk_start:chunk_start + batch_size]
-
-            tensors = []
-            for arr in chunk:
-                pil_img = Image.fromarray(arr, mode='L')
-                tensors.append(transform(pil_img))
-
-            batch_tensor = torch.stack(tensors).to(device)   # (B, 1, 128, 128)
-            logits = model(batch_tensor)                      # (B, num_classes)
-            probs_batch = torch.softmax(logits, dim=1).cpu().numpy()  # (B, num_classes)
-
-            for probs in probs_batch:
-                top1_idx    = int(np.argmax(probs))
-                prob_dict   = {class_names[i]: float(probs[i]) for i in range(len(class_names))}
-                top3_idx    = np.argsort(probs)[::-1][:3]
-                top3        = [{'family': class_names[int(i)], 'confidence': float(probs[i])}
-                               for i in top3_idx]
-                results.append({
-                    'predicted_family': class_names[top1_idx],
-                    'confidence':       float(probs[top1_idx]),
-                    'probabilities':    prob_dict,
-                    'top3':             top3,
-                })
-
-    return results
-```
-
----
-
-## File 6: `tests/test_model.py`
-
-Write this file **exactly** as shown. Do not add, remove, or rename any test.
-
-```python
+#!/usr/bin/env python3
 """
-Test suite for modules/detection/model.py and modules/detection/inference.py
+Full MalTwin training pipeline.
 
-All tests run without the Malimg dataset or a trained model.
-No @pytest.mark.integration tests are needed here — the model can be instantiated
-and inference can be run on random tensors without any dataset.
+Usage:
+    python scripts/train.py [OPTIONS]
 
-Run:
-    pytest tests/test_model.py -v
+Options (all optional — defaults come from config.py / .env):
+    --data-dir    PATH   Path to Malimg dataset root     [default: config.DATA_DIR]
+    --epochs      INT    Number of training epochs        [default: config.EPOCHS]
+    --lr          FLOAT  Learning rate                    [default: config.LR]
+    --batch-size  INT    Batch size                       [default: config.BATCH_SIZE]
+    --workers     INT    DataLoader worker processes      [default: config.NUM_WORKERS]
+    --oversample  STR    Oversampling strategy            [default: config.OVERSAMPLE_STRATEGY]
+                         Choices: oversample_minority | sqrt_inverse | uniform
+    --no-augment         Disable training augmentation    [flag, default: augmentation ON]
+    --seed        INT    Random seed                      [default: config.RANDOM_SEED]
+
+Exit codes:
+    0  success
+    1  dataset not found or invalid
+    2  training or evaluation error
+
+Outputs (written to disk on success):
+    models/best_model.pt                   ← best checkpoint by val_acc
+    models/checkpoints/epoch_NNN_accX.pt   ← per-epoch checkpoints
+    data/processed/class_names.json        ← ordered class name list for dashboard
+    data/processed/eval_metrics.json       ← test-set metrics for dashboard KPI cards
+    data/processed/confusion_matrix.png    ← confusion matrix heatmap
 """
-import pytest
-import torch
-import numpy as np
+import argparse
 import json
-from modules.detection.model import MalTwinCNN, ConvBlock
+import sys
+import random
+import torch
+import numpy as np
+from pathlib import Path
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ConvBlock tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestConvBlock:
-    def test_output_shape_block1(self):
-        """block1: (B, 1, 128, 128) → (B, 32, 64, 64) after MaxPool."""
-        block = ConvBlock(in_channels=1, out_channels=32)
-        x = torch.randn(4, 1, 128, 128)
-        out = block(x)
-        assert out.shape == (4, 32, 64, 64)
-
-    def test_output_shape_block2(self):
-        """block2: (B, 32, 64, 64) → (B, 64, 32, 32) after MaxPool."""
-        block = ConvBlock(in_channels=32, out_channels=64)
-        x = torch.randn(4, 32, 64, 64)
-        out = block(x)
-        assert out.shape == (4, 64, 32, 32)
-
-    def test_output_shape_block3(self):
-        """block3: (B, 64, 32, 32) → (B, 128, 16, 16) after MaxPool."""
-        block = ConvBlock(in_channels=64, out_channels=128)
-        x = torch.randn(4, 64, 32, 32)
-        out = block(x)
-        assert out.shape == (4, 128, 16, 16)
-
-    def test_conv1_bias_false(self):
-        block = ConvBlock(1, 32)
-        assert block.conv1.bias is None, "Conv2d bias should be None when bias=False"
-
-    def test_conv2_bias_false(self):
-        block = ConvBlock(1, 32)
-        assert block.conv2.bias is None, "Conv2d bias should be None when bias=False"
-
-    def test_has_batchnorm(self):
-        import torch.nn as nn
-        block = ConvBlock(1, 32)
-        assert isinstance(block.bn1, nn.BatchNorm2d)
-        assert isinstance(block.bn2, nn.BatchNorm2d)
-
-    def test_has_maxpool(self):
-        import torch.nn as nn
-        block = ConvBlock(1, 32)
-        assert isinstance(block.pool, nn.MaxPool2d)
-
-    def test_custom_dropout(self):
-        import torch.nn as nn
-        block = ConvBlock(1, 32, dropout_p=0.1)
-        assert isinstance(block.drop, nn.Dropout2d)
+def parse_args() -> argparse.Namespace:
+    import config
+    parser = argparse.ArgumentParser(
+        description="Train MalTwin CNN on the Malimg malware image dataset.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument('--data-dir',   type=str,   default=str(config.DATA_DIR),
+                        help='Path to Malimg dataset root directory')
+    parser.add_argument('--epochs',     type=int,   default=config.EPOCHS,
+                        help='Number of training epochs')
+    parser.add_argument('--lr',         type=float, default=config.LR,
+                        help='Adam learning rate')
+    parser.add_argument('--batch-size', type=int,   default=config.BATCH_SIZE,
+                        help='Batch size for DataLoaders')
+    parser.add_argument('--workers',    type=int,   default=config.NUM_WORKERS,
+                        help='Number of DataLoader worker processes')
+    parser.add_argument('--oversample', type=str,   default=config.OVERSAMPLE_STRATEGY,
+                        choices=['oversample_minority', 'sqrt_inverse', 'uniform'],
+                        help='Class oversampling strategy for training loader')
+    parser.add_argument('--no-augment', action='store_true',
+                        help='Disable training augmentation (use val transforms for train)')
+    parser.add_argument('--seed',       type=int,   default=config.RANDOM_SEED,
+                        help='Random seed for reproducibility')
+    return parser.parse_args()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MalTwinCNN architecture tests
-# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    args = parse_args()
 
-class TestMalTwinCNN:
-    def test_forward_pass_output_shape(self, num_classes):
-        model = MalTwinCNN(num_classes=num_classes)
-        x = torch.randn(4, 1, 128, 128)
-        out = model(x)
-        assert out.shape == (4, num_classes)
+    # ── 1. Seed everything ─────────────────────────────────────────────────────
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
-    def test_single_sample_forward(self, num_classes):
-        model = MalTwinCNN(num_classes=num_classes)
-        x = torch.randn(1, 1, 128, 128)
-        out = model(x)
-        assert out.shape == (1, num_classes)
+    import config
 
-    def test_parameter_count_reasonable(self, num_classes):
-        model = MalTwinCNN(num_classes=num_classes)
-        total = sum(p.numel() for p in model.parameters())
-        assert total > 1_000_000, f"Too few parameters: {total}"
-        assert total < 20_000_000, f"Too many parameters: {total}"
+    # ── 2. Validate dataset ────────────────────────────────────────────────────
+    from modules.dataset.preprocessor import validate_dataset_integrity
+    print("=" * 55)
+    print("MalTwin Training Pipeline")
+    print("=" * 55)
+    print("\n[1/6] Validating dataset...")
+    try:
+        report = validate_dataset_integrity(Path(args.data_dir))
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    def test_output_is_raw_logits_no_softmax(self, num_classes):
-        """
-        Verify softmax was NOT applied in forward().
-        If softmax was applied, all outputs would be in [0,1] and sum to 1.
-        We verify that softmax of the output produces valid probabilities —
-        this tests the contract (logits in, probs after softmax), not the values.
-        """
-        model = MalTwinCNN(num_classes=num_classes)
-        model.eval()
-        x = torch.randn(2, 1, 128, 128)
-        with torch.no_grad():
-            out = model(x)
-        # Applying softmax to raw logits must yield probabilities that sum to 1
-        probs = torch.softmax(out, dim=1)
-        assert torch.allclose(probs.sum(dim=1), torch.ones(2), atol=1e-5)
+    print(f"  Families found:   {len(report['families'])}")
+    print(f"  Total samples:    {report['total']}")
+    print(f"  Imbalance ratio:  {report['imbalance_ratio']:.1f}x "
+          f"({report['max_class']} vs {report['min_class']})")
+    if report['corrupt_files']:
+        print(f"  WARNING: {len(report['corrupt_files'])} corrupt file(s) found — skipping")
 
-    def test_gradcam_layer_attribute_exists(self, num_classes):
-        """
-        CRITICAL: self.gradcam_layer must be set and must point to block3.conv2.
-        This is required by Module 7 (Grad-CAM).
-        """
-        model = MalTwinCNN(num_classes=num_classes)
-        assert hasattr(model, 'gradcam_layer'), \
-            "MalTwinCNN must have self.gradcam_layer attribute"
-        assert model.gradcam_layer is model.block3.conv2, \
-            "gradcam_layer must be self.block3.conv2 (the second conv of block3)"
+    # ── 3. Build DataLoaders ───────────────────────────────────────────────────
+    print("\n[2/6] Building DataLoaders...")
+    try:
+        from modules.dataset.loader import get_dataloaders
+        train_loader, val_loader, test_loader, class_names = get_dataloaders(
+            data_dir=Path(args.data_dir),
+            img_size=config.IMG_SIZE,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            oversample_strategy=args.oversample,
+            augment_train=not args.no_augment,
+            random_seed=args.seed,
+        )
+    except Exception as e:
+        print(f"ERROR building DataLoaders: {e}", file=sys.stderr)
+        sys.exit(2)
 
-    def test_block_attributes_exist(self, num_classes):
-        model = MalTwinCNN(num_classes=num_classes)
-        assert hasattr(model, 'block1')
-        assert hasattr(model, 'block2')
-        assert hasattr(model, 'block3')
-        assert hasattr(model, 'pool')
-        assert hasattr(model, 'classifier')
+    print(f"  Train batches:  {len(train_loader)}")
+    print(f"  Val batches:    {len(val_loader)}")
+    print(f"  Test batches:   {len(test_loader)}")
+    print(f"  Classes:        {len(class_names)}")
+    print(f"  Augmentation:   {'OFF (--no-augment)' if args.no_augment else 'ON'}")
+    print(f"  Oversample:     {args.oversample}")
 
-    def test_block1_channels(self, num_classes):
-        model = MalTwinCNN(num_classes=num_classes)
-        assert model.block1.conv1.in_channels == 1
-        assert model.block1.conv1.out_channels == 32
+    # ── 4. Build model ─────────────────────────────────────────────────────────
+    print("\n[3/6] Initialising model...")
+    try:
+        from modules.detection.model import MalTwinCNN
+        model = MalTwinCNN(num_classes=len(class_names)).to(config.DEVICE)
+    except Exception as e:
+        print(f"ERROR initialising model: {e}", file=sys.stderr)
+        sys.exit(2)
 
-    def test_block2_channels(self, num_classes):
-        model = MalTwinCNN(num_classes=num_classes)
-        assert model.block2.conv1.in_channels == 32
-        assert model.block2.conv1.out_channels == 64
+    total_params     = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Architecture:       MalTwinCNN")
+    print(f"  Total parameters:   {total_params:,}")
+    print(f"  Trainable params:   {trainable_params:,}")
+    print(f"  Device:             {config.DEVICE}")
 
-    def test_block3_channels(self, num_classes):
-        model = MalTwinCNN(num_classes=num_classes)
-        assert model.block3.conv1.in_channels == 64
-        assert model.block3.conv1.out_channels == 128
+    # ── 5. Train ───────────────────────────────────────────────────────────────
+    print(f"\n[4/6] Training for {args.epochs} epoch(s)...")
+    try:
+        from modules.detection.trainer import train
+        history = train(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=config.DEVICE,
+            epochs=args.epochs,
+            lr=args.lr,
+        )
+    except Exception as e:
+        print(f"ERROR during training: {e}", file=sys.stderr)
+        sys.exit(2)
 
-    def test_deterministic_in_eval_mode(self, num_classes):
-        model = MalTwinCNN(num_classes=num_classes)
-        model.eval()
-        x = torch.randn(2, 1, 128, 128)
-        with torch.no_grad():
-            out1 = model(x)
-            out2 = model(x)
-        torch.testing.assert_close(out1, out2)
+    print(f"\nTraining complete.")
+    print(f"  Best val accuracy: {history['best_val_acc']:.4f} at epoch {history['best_epoch']}")
+    print(f"  Model saved to:    {config.BEST_MODEL_PATH}")
 
-    def test_train_mode_dropout_nondeterministic(self, num_classes):
-        """In train mode, Dropout causes different outputs for different seeds."""
-        model = MalTwinCNN(num_classes=num_classes)
-        model.train()
-        x = torch.randn(4, 1, 128, 128)
-        torch.manual_seed(0)
-        out1 = model(x)
-        torch.manual_seed(1)
-        out2 = model(x)
-        assert not torch.equal(out1, out2)
-
-    def test_weight_initialization_conv_no_zeros(self, num_classes):
-        """Kaiming init should produce non-zero weights."""
-        model = MalTwinCNN(num_classes=num_classes)
-        # At least some weights should be nonzero after Kaiming init
-        conv_weights = model.block1.conv1.weight.data
-        assert conv_weights.abs().sum() > 0
-
-    def test_batchnorm_initialized_correctly(self, num_classes):
-        """BatchNorm weight=1, bias=0 after _initialize_weights."""
-        model = MalTwinCNN(num_classes=num_classes)
-        # Check block1's BN
-        assert torch.allclose(model.block1.bn1.weight, torch.ones_like(model.block1.bn1.weight))
-        assert torch.allclose(model.block1.bn1.bias, torch.zeros_like(model.block1.bn1.bias))
-
-    def test_adaptive_avg_pool_output(self, num_classes):
-        """AdaptiveAvgPool2d should output (B, 128, 4, 4) before flatten."""
-        import torch.nn as nn
-        model = MalTwinCNN(num_classes=num_classes)
-        # Run up to just before classifier
-        x = torch.randn(2, 1, 128, 128)
-        x = model.block1(x)   # (2, 32, 64, 64)
-        x = model.block2(x)   # (2, 64, 32, 32)
-        x = model.block3(x)   # (2, 128, 16, 16)
-        x = model.pool(x)     # (2, 128, 4, 4)
-        assert x.shape == (2, 128, 4, 4)
-
-    def test_classifier_output_size(self, num_classes):
-        """Classifier input should be 128*4*4=2048."""
-        model = MalTwinCNN(num_classes=num_classes)
-        # Find the first Linear layer in classifier
-        import torch.nn as nn
-        first_linear = next(m for m in model.classifier.modules() if isinstance(m, nn.Linear))
-        assert first_linear.in_features == 2048
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Inference tests (predict_single, load_model)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestPredictSingle:
-    def _make_result(self, num_classes, sample_grayscale_array):
-        from modules.detection.inference import predict_single
-        model = MalTwinCNN(num_classes=num_classes)
-        model.eval()
-        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
-        return predict_single(model, sample_grayscale_array, class_names, torch.device('cpu'))
-
-    def test_returns_required_keys(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        assert 'predicted_family' in result
-        assert 'confidence' in result
-        assert 'probabilities' in result
-        assert 'top3' in result
-
-    def test_confidence_in_valid_range(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        assert 0.0 <= result['confidence'] <= 1.0
-
-    def test_probabilities_sum_to_one(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        total = sum(result['probabilities'].values())
-        assert abs(total - 1.0) < 1e-5
-
-    def test_probabilities_has_all_classes(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        assert len(result['probabilities']) == num_classes
-
-    def test_all_probabilities_nonnegative(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        assert all(v >= 0.0 for v in result['probabilities'].values())
-
-    def test_all_probabilities_at_most_one(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        assert all(v <= 1.0 for v in result['probabilities'].values())
-
-    def test_top3_has_three_entries(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        assert len(result['top3']) == 3
-
-    def test_top3_entries_have_required_keys(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        for entry in result['top3']:
-            assert 'family' in entry
-            assert 'confidence' in entry
-
-    def test_predicted_family_matches_top3_first(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        assert result['predicted_family'] == result['top3'][0]['family']
-
-    def test_predicted_family_confidence_matches_top3_first(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        assert abs(result['confidence'] - result['top3'][0]['confidence']) < 1e-6
-
-    def test_top3_sorted_descending(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        confs = [item['confidence'] for item in result['top3']]
-        assert confs == sorted(confs, reverse=True)
-
-    def test_predicted_family_is_valid_class(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
-        assert result['predicted_family'] in class_names
-
-    def test_all_values_json_serialisable(self, sample_grayscale_array, num_classes):
-        """All float values must be Python float, not numpy float32."""
-        result = self._make_result(num_classes, sample_grayscale_array)
-        # Should not raise TypeError
-        json.dumps(result)
-
-    def test_confidence_is_python_float(self, sample_grayscale_array, num_classes):
-        result = self._make_result(num_classes, sample_grayscale_array)
-        assert isinstance(result['confidence'], float)
-
-    def test_uses_val_transforms_not_train(self, sample_grayscale_array, num_classes):
-        """
-        Calling predict_single twice on the same image should return identical results
-        (val transforms are deterministic; train transforms are not).
-        """
-        from modules.detection.inference import predict_single
-        model = MalTwinCNN(num_classes=num_classes)
-        model.eval()
-        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
-        r1 = predict_single(model, sample_grayscale_array, class_names, torch.device('cpu'))
-        r2 = predict_single(model, sample_grayscale_array, class_names, torch.device('cpu'))
-        assert r1['predicted_family'] == r2['predicted_family']
-        assert abs(r1['confidence'] - r2['confidence']) < 1e-6
-
-
-class TestLoadModel:
-    def test_raises_on_missing_file(self, tmp_path):
+    # ── 6. Evaluate on test set ────────────────────────────────────────────────
+    print("\n[5/6] Evaluating best model on test set...")
+    try:
         from modules.detection.inference import load_model
-        missing = tmp_path / 'nonexistent.pt'
-        with pytest.raises(FileNotFoundError, match="not found"):
-            load_model(model_path=missing, num_classes=25, device=torch.device('cpu'))
+        from modules.detection.evaluator import evaluate, format_metrics_table, plot_confusion_matrix
+        best_model = load_model(config.BEST_MODEL_PATH, len(class_names), config.DEVICE)
+        metrics = evaluate(best_model, test_loader, config.DEVICE, class_names)
+    except Exception as e:
+        print(f"ERROR during evaluation: {e}", file=sys.stderr)
+        sys.exit(2)
 
-    def test_loads_saved_state_dict(self, tmp_path, num_classes):
+    print(format_metrics_table(metrics, class_names))
+
+    # ── 7. Save eval metrics JSON ──────────────────────────────────────────────
+    print("\n[6/6] Saving outputs...")
+    try:
+        metrics_path = config.PROCESSED_DIR / 'eval_metrics.json'
+        # confusion_matrix is np.ndarray — not JSON serialisable; exclude it
+        # classification_report is a string — exclude (too verbose for dashboard)
+        serialisable = {
+            k: v for k, v in metrics.items()
+            if k not in ('confusion_matrix', 'per_class', 'classification_report')
+        }
+        # per_class contains nested dicts with Python floats/ints — safe to serialise
+        serialisable['per_class'] = {
+            family: dict(stats) for family, stats in metrics['per_class'].items()
+        }
+        with open(metrics_path, 'w') as f:
+            json.dump(serialisable, f, indent=2)
+        print(f"  Eval metrics → {metrics_path}")
+    except Exception as e:
+        # Non-fatal: metrics file is nice-to-have for dashboard
+        print(f"  WARNING: Could not save eval metrics: {e}", file=sys.stderr)
+
+    # ── 8. Save confusion matrix PNG ───────────────────────────────────────────
+    try:
+        cm_path = config.PROCESSED_DIR / 'confusion_matrix.png'
+        plot_confusion_matrix(metrics['confusion_matrix'], class_names, cm_path)
+        print(f"  Confusion matrix → {cm_path}")
+    except Exception as e:
+        print(f"  WARNING: Could not save confusion matrix: {e}", file=sys.stderr)
+
+    print("\n" + "=" * 55)
+    print("Done!")
+    print(f"  Launch dashboard: streamlit run modules/dashboard/app.py")
+    print("=" * 55)
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## File 3: `scripts/evaluate.py`
+
+```python
+#!/usr/bin/env python3
+"""
+Evaluate best_model.pt on the test split only (no retraining).
+
+Usage:
+    python scripts/evaluate.py [OPTIONS]
+
+Options:
+    --model-path  PATH   Path to trained model .pt file   [default: config.BEST_MODEL_PATH]
+    --data-dir    PATH   Path to Malimg dataset root       [default: config.DATA_DIR]
+    --batch-size  INT    Batch size for test DataLoader    [default: config.BATCH_SIZE]
+    --workers     INT    DataLoader worker processes       [default: config.NUM_WORKERS]
+    --seed        INT    Random seed (affects split)       [default: config.RANDOM_SEED]
+    --save-metrics       Save eval_metrics.json to data/processed/ [flag]
+
+Exit codes:
+    0  success
+    1  model file or dataset not found
+    2  evaluation error
+
+Use case:
+    Re-evaluate after code changes or hyperparameter review without retraining.
+    Produces the same test split as training (same seed and split ratios).
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def parse_args() -> argparse.Namespace:
+    import config
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained MalTwin model on the Malimg test split.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument('--model-path',   type=str, default=str(config.BEST_MODEL_PATH),
+                        help='Path to best_model.pt checkpoint')
+    parser.add_argument('--data-dir',     type=str, default=str(config.DATA_DIR),
+                        help='Path to Malimg dataset root directory')
+    parser.add_argument('--batch-size',   type=int, default=config.BATCH_SIZE,
+                        help='Batch size for test DataLoader')
+    parser.add_argument('--workers',      type=int, default=config.NUM_WORKERS,
+                        help='Number of DataLoader worker processes')
+    parser.add_argument('--seed',         type=int, default=config.RANDOM_SEED,
+                        help='Random seed (must match training seed for same test split)')
+    parser.add_argument('--save-metrics', action='store_true',
+                        help='Save eval_metrics.json to data/processed/')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    import config
+
+    model_path = Path(args.model_path)
+    data_dir   = Path(args.data_dir)
+
+    # ── 1. Validate model file exists ─────────────────────────────────────────
+    if not model_path.exists():
+        print(
+            f"ERROR: Model file not found: {model_path}\n"
+            "Run scripts/train.py first to produce best_model.pt",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ── 2. Validate dataset exists ────────────────────────────────────────────
+    if not data_dir.exists():
+        print(
+            f"ERROR: Dataset directory not found: {data_dir}\n"
+            "Download Malimg from Kaggle and extract to data/malimg/",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ── 3. Load class names ───────────────────────────────────────────────────
+    print("Loading class names...")
+    try:
+        from modules.dataset.preprocessor import load_class_names
+        class_names = load_class_names(config.CLASS_NAMES_PATH)
+        print(f"  {len(class_names)} classes loaded from {config.CLASS_NAMES_PATH}")
+    except FileNotFoundError:
+        # Fall back to scanning the dataset directory
+        print("  class_names.json not found — scanning dataset directory...")
+        from modules.dataset.preprocessor import encode_labels
+        subdirs = sorted([p.name for p in data_dir.iterdir() if p.is_dir()])
+        label_map = encode_labels(subdirs)
+        class_names = sorted(label_map.keys())
+        print(f"  {len(class_names)} classes found in dataset")
+
+    # ── 4. Build test DataLoader ──────────────────────────────────────────────
+    print("Building test DataLoader...")
+    try:
+        from modules.dataset.loader import MalimgDataset
+        from modules.enhancement.augmentor import get_val_transforms
+        from torch.utils.data import DataLoader
+
+        test_ds = MalimgDataset(
+            data_dir=data_dir,
+            split='test',
+            img_size=config.IMG_SIZE,
+            transform=get_val_transforms(config.IMG_SIZE),
+            random_seed=args.seed,
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+        )
+        print(f"  Test samples:  {len(test_ds)}")
+        print(f"  Test batches:  {len(test_loader)}")
+    except Exception as e:
+        print(f"ERROR building test DataLoader: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # ── 5. Load model ─────────────────────────────────────────────────────────
+    print(f"Loading model from {model_path}...")
+    try:
         from modules.detection.inference import load_model
-        # Save a freshly initialised model's state dict
-        model = MalTwinCNN(num_classes=num_classes)
-        pt_path = tmp_path / 'test_model.pt'
-        torch.save(model.state_dict(), pt_path)
+        model = load_model(
+            model_path=model_path,
+            num_classes=len(class_names),
+            device=config.DEVICE,
+        )
+        print(f"  Device: {config.DEVICE}")
+    except Exception as e:
+        print(f"ERROR loading model: {e}", file=sys.stderr)
+        sys.exit(1)
 
-        # Load it back
-        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
-        assert isinstance(loaded, MalTwinCNN)
+    # ── 6. Evaluate ───────────────────────────────────────────────────────────
+    print("\nRunning evaluation...")
+    try:
+        from modules.detection.evaluator import evaluate, format_metrics_table
+        metrics = evaluate(model, test_loader, config.DEVICE, class_names)
+    except Exception as e:
+        print(f"ERROR during evaluation: {e}", file=sys.stderr)
+        sys.exit(2)
 
-    def test_loaded_model_is_in_eval_mode(self, tmp_path, num_classes):
-        from modules.detection.inference import load_model
-        model = MalTwinCNN(num_classes=num_classes)
-        pt_path = tmp_path / 'test_model.pt'
-        torch.save(model.state_dict(), pt_path)
-        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
-        assert not loaded.training, "load_model() must return model in eval() mode"
+    # ── 7. Print results ──────────────────────────────────────────────────────
+    print(format_metrics_table(metrics, class_names))
+    print("\nClassification Report:")
+    print(metrics['classification_report'])
 
-    def test_loaded_model_produces_correct_output_shape(self, tmp_path, num_classes):
-        from modules.detection.inference import load_model
-        model = MalTwinCNN(num_classes=num_classes)
-        pt_path = tmp_path / 'test_model.pt'
-        torch.save(model.state_dict(), pt_path)
-        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
-        x = torch.randn(1, 1, 128, 128)
-        with torch.no_grad():
-            out = loaded(x)
-        assert out.shape == (1, num_classes)
+    # ── 8. Optionally save metrics ────────────────────────────────────────────
+    if args.save_metrics:
+        try:
+            metrics_path = config.PROCESSED_DIR / 'eval_metrics.json'
+            serialisable = {
+                k: v for k, v in metrics.items()
+                if k not in ('confusion_matrix', 'per_class', 'classification_report')
+            }
+            serialisable['per_class'] = {
+                family: dict(stats) for family, stats in metrics['per_class'].items()
+            }
+            with open(metrics_path, 'w') as f:
+                json.dump(serialisable, f, indent=2)
+            print(f"Eval metrics saved to {metrics_path}")
+        except Exception as e:
+            print(f"WARNING: Could not save eval metrics: {e}", file=sys.stderr)
 
-    def test_loaded_weights_match_original(self, tmp_path, num_classes):
-        from modules.detection.inference import load_model
-        model = MalTwinCNN(num_classes=num_classes)
-        pt_path = tmp_path / 'test_model.pt'
-        torch.save(model.state_dict(), pt_path)
-        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
-
-        original_w = model.block1.conv1.weight.data
-        loaded_w   = loaded.block1.conv1.weight.data
-        torch.testing.assert_close(original_w, loaded_w)
+    sys.exit(0)
 
 
-class TestPredictBatch:
-    def test_returns_list_of_dicts(self, sample_grayscale_array, num_classes):
-        from modules.detection.inference import predict_batch
-        model = MalTwinCNN(num_classes=num_classes)
-        model.eval()
-        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
-        results = predict_batch(model, [sample_grayscale_array, sample_grayscale_array],
-                                class_names, torch.device('cpu'))
-        assert isinstance(results, list)
-        assert len(results) == 2
+if __name__ == '__main__':
+    main()
+```
 
-    def test_batch_results_match_single(self, sample_grayscale_array, num_classes):
-        """predict_batch on one image should match predict_single on same image."""
-        from modules.detection.inference import predict_batch, predict_single
-        model = MalTwinCNN(num_classes=num_classes)
-        model.eval()
-        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
+---
 
-        single = predict_single(model, sample_grayscale_array, class_names, torch.device('cpu'))
-        batch  = predict_batch(model, [sample_grayscale_array], class_names, torch.device('cpu'))
+## File 4: `scripts/convert_binary.py`
 
-        assert single['predicted_family'] == batch[0]['predicted_family']
-        assert abs(single['confidence'] - batch[0]['confidence']) < 1e-5
+```python
+#!/usr/bin/env python3
+"""
+Convert a single PE or ELF binary file to a 128×128 grayscale PNG.
 
-    def test_result_order_preserved(self, num_classes):
-        """Results must be in same order as inputs."""
-        from modules.detection.inference import predict_batch
-        import cv2
-        model = MalTwinCNN(num_classes=num_classes)
-        model.eval()
-        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
+Usage:
+    python scripts/convert_binary.py --input FILE [--output FILE.png] [--size INT]
 
-        # Create two distinct arrays: all-zeros and all-255
-        arr_black = np.zeros((128, 128), dtype=np.uint8)
-        arr_white = np.full((128, 128), 255, dtype=np.uint8)
+Arguments:
+    --input   PATH   Path to input binary file (.exe, .dll, ELF)  [required]
+    --output  PATH   Path for output PNG file                      [default: <input>.png]
+    --size    INT    Output image size (square)                     [default: 128]
 
-        results = predict_batch(model, [arr_black, arr_white], class_names, torch.device('cpu'))
-        assert len(results) == 2
-        # Both should return valid results (can't predict which family, but structure valid)
-        for r in results:
-            assert 'predicted_family' in r
-            assert 'confidence' in r
+Exit codes:
+    0  success
+    1  input file not found
+    2  invalid binary format (not PE or ELF)
+    3  conversion or save error
+
+No ML dependencies. This script works without PyTorch or scikit-learn installed.
+"""
+import argparse
+import sys
+from pathlib import Path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert a PE/ELF binary to a grayscale PNG image.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument('--input',  type=str, required=True,
+                        help='Path to input binary file (.exe, .dll, or ELF)')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Path for output PNG (default: <input_name>.png)')
+    parser.add_argument('--size',   type=int, default=128,
+                        help='Output image size in pixels (NxN square)')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    input_path  = Path(args.input)
+    output_path = Path(args.output) if args.output else input_path.with_suffix('.png')
+    img_size    = args.size
+
+    # ── 1. Verify input file exists ────────────────────────────────────────────
+    if not input_path.exists():
+        print(f"ERROR: Input file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if not input_path.is_file():
+        print(f"ERROR: Input path is not a file: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # ── 2. Read raw bytes ──────────────────────────────────────────────────────
+    print(f"Reading: {input_path}  ({input_path.stat().st_size:,} bytes)")
+    file_bytes = input_path.read_bytes()
+
+    # ── 3. Validate binary format ──────────────────────────────────────────────
+    from modules.binary_to_image.utils import validate_binary_format, compute_sha256, get_file_metadata
+    try:
+        file_format = validate_binary_format(file_bytes)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    print(f"Format:  {file_format}")
+
+    # ── 4. Compute SHA-256 ─────────────────────────────────────────────────────
+    sha256 = compute_sha256(file_bytes)
+    print(f"SHA-256: {sha256}")
+
+    # ── 5. Print full metadata ─────────────────────────────────────────────────
+    meta = get_file_metadata(file_bytes, input_path.name, file_format)
+    print(f"Size:    {meta['size_human']}")
+    print(f"Time:    {meta['upload_time']}")
+
+    # ── 6. Convert bytes → grayscale array ────────────────────────────────────
+    from modules.binary_to_image.converter import BinaryConverter
+    try:
+        converter  = BinaryConverter(img_size=img_size)
+        img_array  = converter.convert(file_bytes)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        print(f"ERROR during conversion: {e}", file=sys.stderr)
+        sys.exit(3)
+
+    # ── 7. Save PNG to disk ────────────────────────────────────────────────────
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        converter.save(img_array, output_path)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(3)
+
+    print(f"\nSaved {img_size}x{img_size} grayscale PNG to {output_path}")
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
 ```
 
 ---
 
 ## Definition of Done
 
-Run these commands. All must pass before Phase 4 is complete.
+Phase 5 has no dedicated pytest test file in the PRD — the definition of done is that all three scripts import cleanly and run without errors. Run these checks:
 
 ```bash
-# Phase 4 tests — no dataset, no trained model required
-pytest tests/test_model.py -v
+# ── Smoke test: verify scripts import without errors ──────────────────────────
+python -c "import scripts.train"
+python -c "import scripts.evaluate"
+python -c "import scripts.convert_binary"
 
-# Expected: all tests pass with zero failures
-# ====== 40+ passed ======
+# All three should produce no output and exit with code 0.
 
-# Regression check — phases 1, 2, 3 must still pass
-pytest tests/test_converter.py tests/test_dataset.py tests/test_enhancement.py \
+# ── Verify argparse help works (no dataset needed) ────────────────────────────
+python scripts/train.py --help
+python scripts/evaluate.py --help
+python scripts/convert_binary.py --help
+
+# ── Convert a test binary (uses Phase 1 fixtures) ─────────────────────────────
+python scripts/convert_binary.py \
+    --input tests/fixtures/sample_pe.exe \
+    --output /tmp/test_output.png \
+    --size 128
+
+# Expected output:
+# Reading: tests/fixtures/sample_pe.exe  (1,024 bytes)
+# Format:  PE
+# SHA-256: <64 hex chars>
+# Size:    1.0 KB
+# Time:    <ISO 8601 timestamp>
+# Saved 128x128 grayscale PNG to /tmp/test_output.png
+
+# ── Verify exit code 1 on missing input ───────────────────────────────────────
+python scripts/convert_binary.py --input /tmp/does_not_exist.exe
+echo "Exit code: $?"
+# Expected: Exit code: 1
+
+# ── Verify exit code 2 on non-binary input ────────────────────────────────────
+echo "not a binary" > /tmp/fake.exe
+python scripts/convert_binary.py --input /tmp/fake.exe
+echo "Exit code: $?"
+# Expected: Exit code: 2
+
+# ── Regression check: all earlier tests still pass ────────────────────────────
+pytest tests/test_converter.py tests/test_dataset.py \
+       tests/test_enhancement.py tests/test_model.py \
        -v -m "not integration"
 ```
 
+### With the real Malimg dataset (full smoke test)
+
+```bash
+# 2-epoch smoke train — fast check that the full pipeline runs end-to-end
+python scripts/train.py --epochs 2 --workers 0
+
+# Expected output (abbreviated):
+# ======================================================
+# MalTwin Training Pipeline
+# ======================================================
+# [1/6] Validating dataset...
+#   Families found:   25
+#   Total samples:    9339
+#   Imbalance ratio:  36.9x (Allaple.A vs Skintrim.N)
+# [2/6] Building DataLoaders...
+# [3/6] Initialising model...
+# [4/6] Training for 2 epoch(s)...
+# [5/6] Evaluating best model on test set...
+# [6/6] Saving outputs...
+# Done!
+
+# Verify outputs exist
+ls -lh models/best_model.pt
+ls -lh data/processed/class_names.json
+ls -lh data/processed/eval_metrics.json
+ls -lh data/processed/confusion_matrix.png
+
+# Evaluate-only script
+python scripts/evaluate.py
+
+# Expected: prints the same metrics table as training
+```
+
+---
+
 ### Checklist
 
-- [ ] `pytest tests/test_model.py -v` passes with zero failures
-- [ ] No regressions in earlier test files
-- [ ] `MalTwinCNN.__init__` sets `self.gradcam_layer = self.block3.conv2`
-- [ ] `model.forward()` returns raw logits — NO `torch.softmax()` inside `forward()`
-- [ ] `CrossEntropyLoss` is used in `trainer.py` (not NLLLoss + softmax)
-- [ ] `torch.manual_seed(config.RANDOM_SEED)` is at the **top of `train()`**, not module level
-- [ ] `validate_epoch()` uses `model.eval()` + `torch.no_grad()` together
-- [ ] `matplotlib.use('Agg')` is at **module level** in `evaluator.py` (before any plt import)
-- [ ] `plt.close(fig)` is called after `plt.savefig()` in `plot_confusion_matrix()`
-- [ ] `torch.load(..., weights_only=True)` is used in `load_model()`
-- [ ] `predict_single()` calls `get_val_transforms`, not `get_train_transforms`
-- [ ] All probability values returned by `predict_single()` are Python `float`, not `np.float32`
-- [ ] `load_model()` returns model in `eval()` mode
-- [ ] `bias=False` in all Conv2d layers in `ConvBlock`
+- [ ] `python -c "import scripts.train"` exits with code 0 (no import errors)
+- [ ] `python -c "import scripts.evaluate"` exits with code 0
+- [ ] `python -c "import scripts.convert_binary"` exits with code 0
+- [ ] `python scripts/train.py --help` prints usage without error
+- [ ] `python scripts/evaluate.py --help` prints usage without error
+- [ ] `python scripts/convert_binary.py --help` prints usage without error
+- [ ] `python scripts/convert_binary.py --input tests/fixtures/sample_pe.exe --output /tmp/t.png` exits 0 and creates PNG
+- [ ] Missing input file → exit code 1
+- [ ] Non-PE/ELF input → exit code 2
+- [ ] `scripts/__init__.py` exists (even if empty)
+- [ ] All three scripts have `if __name__ == '__main__': main()` guard
+- [ ] No script imports from another script
+- [ ] `torch.manual_seed()` called in `train.py`'s `main()`, not at module level
+- [ ] `sys.exit(0)` at end of each successful `main()`
 
 ---
 
@@ -1187,17 +650,16 @@ pytest tests/test_converter.py tests/test_dataset.py tests/test_enhancement.py \
 
 | Bug | Symptom | Fix |
 |-----|---------|-----|
-| `torch.softmax()` inside `forward()` | CrossEntropyLoss produces wrong gradients; model trains poorly | Remove softmax from `forward()`. Apply in `predict_single()` only. |
-| Forgetting `self.gradcam_layer = self.block3.conv2` | `test_gradcam_layer_attribute_exists` fails | Set it explicitly in `__init__` after `self.block3` is created |
-| `matplotlib.use('Agg')` inside a function | Fails if any plt has already been imported elsewhere | Must be at **module level**, line 3–4 of evaluator.py |
-| Missing `plt.close(fig)` | Memory leak during long training runs | Always `plt.close(fig)` after `plt.savefig()` |
-| `torch.load()` without `weights_only=True` | PyTorch 2.x security warning; potential attack surface | Use `torch.load(path, map_location=device, weights_only=True)` |
-| `get_train_transforms` in `predict_single` | Results non-deterministic (GaussianNoise, random flips) | Use `get_val_transforms` — always for inference |
-| `np.float32` values in result dict | `json.dumps(result)` raises `TypeError` | Wrap all values: `float(probs[i])` not `probs[i]` |
-| `torch.manual_seed()` at module level | Seed applied at import time, not at training start | Call inside `train()` as first line |
-| `bias=True` in Conv2d before BatchNorm | Extra parameters, redundant computation | `bias=False` whenever BatchNorm follows |
-| `validate_epoch` without `model.eval()` | Dropout active during validation → noisy val_acc | Always call `model.eval()` before the val loop |
+| Logic outside `if __name__ == '__main__'` | Import smoke test triggers side effects | Wrap all logic in `main()`, guard with `__name__` check |
+| `sys.exit()` inside `parse_args()` | Argparse `--help` causes unexpected exit codes | Only call `sys.exit()` inside `main()` |
+| Missing `scripts/__init__.py` | `python -c "import scripts.train"` raises `ModuleNotFoundError` | Create the empty file |
+| `str(path)` used in argparse default before `config` import | `AttributeError` at parse time | Import `config` inside `parse_args()` body, not at module level |
+| `evaluate.py` building train loader instead of test loader | Wrong split evaluated | Always pass `split='test'` to `MalimgDataset` in `evaluate.py` |
+| `--seed` default hardcoded as `42` instead of `config.RANDOM_SEED` | Seed differs from training if `.env` overrides it | Use `default=config.RANDOM_SEED` in argparse |
+| `shuffle=True` on test DataLoader in `evaluate.py` | Non-reproducible evaluation order | `shuffle=False` on test and val loaders always |
+| Catching all exceptions around `validate_dataset_integrity` | Dataset not found swallowed silently | Only catch `FileNotFoundError` for missing dataset; re-raise or `sys.exit(1)` |
+| `confusion_matrix` key passed to `json.dump` | `TypeError: Object of type ndarray is not JSON serializable` | Exclude `confusion_matrix`, `per_class` raw, and `classification_report` before dumping |
 
 ---
 
-*Phase 4 complete → proceed to Phase 5: CLI scripts (`scripts/train.py`, `scripts/evaluate.py`, `scripts/convert_binary.py`).*
+*Phase 5 complete → proceed to Phase 6: Dashboard (`modules/dashboard/db.py`, `state.py`, `pages/`, `app.py`).*
