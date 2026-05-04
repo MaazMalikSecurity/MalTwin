@@ -36,17 +36,14 @@ def configure_page() -> None:
     st.set_page_config() is the very first Streamlit call in the app.
     """
     st.set_page_config(
-        page_title=config.DASHBOARD_TITLE,
-        page_icon="🛡️",
+        page_title="MalTwin — IIoT Malware Detection",
+        page_icon="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='12' fill='%23161B22'/><rect x='20' y='20' width='60' height='8' rx='2' fill='%23E8A020'/><rect x='20' y='36' width='42' height='8' rx='2' fill='%23388BFD'/><rect x='20' y='52' width='52' height='8' rx='2' fill='%233FB950'/><rect x='20' y='68' width='30' height='8' rx='2' fill='%238B949E'/></svg>",
         layout="wide",
         initial_sidebar_state="expanded",
         menu_items={
             'Get Help': None,
             'Report a bug': None,
-            'About': (
-                "MalTwin — AI-based IIoT Malware Detection Framework\n"
-                "COMSATS University, Islamabad | BS Cyber Security 2023-2027"
-            ),
+            'About': "MalTwin v1.0 — COMSATS University Islamabad",
         },
     )
 
@@ -64,12 +61,11 @@ def _check_network_binding() -> None:
         server_addr = os.environ.get('STREAMLIT_SERVER_ADDRESS', '127.0.0.1')
         if server_addr not in ('localhost', '127.0.0.1', '::1'):
             st.warning(
-                "⚠️ **Security Notice (SRS SEC-5):** "
+                "Security Notice (SRS SEC-5): "
                 "This dashboard is accessible on a non-localhost network interface "
                 f"(`{server_addr}`). "
                 "MalTwin is a research prototype and is not hardened for external exposure. "
                 "Ensure your network environment is trusted before proceeding.",
-                icon="🔒",
             )
     except Exception:
         pass   # non-critical — never block startup
@@ -125,95 +121,111 @@ def render_sidebar() -> str:
     """
     Render sidebar navigation with availability indicators.
     Returns the selected page label string.
-    Greyed-out pages are shown with ⚠️ prefix in the selectbox.
     """
-    st.sidebar.markdown("# 🛡️ MalTwin")
-    st.sidebar.markdown("*IIoT Malware Detection*")
+    from modules.dashboard.theme import apply_theme, COLORS, status_badge
+
+    apply_theme()
+
+    # Sidebar wordmark
+    st.sidebar.markdown(
+        f'<div style="padding:20px 0 16px;">'
+        f'<div style="font-family:\'DM Sans\',sans-serif;font-size:18px;font-weight:600;'
+        f'letter-spacing:0.04em;color:{COLORS["text_primary"]};">MalTwin</div>'
+        f'<div style="font-family:\'DM Sans\',sans-serif;font-size:11px;font-weight:400;'
+        f'letter-spacing:0.08em;text-transform:uppercase;color:{COLORS["text_secondary"]};">'
+        f'IIoT Malware Detection</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     st.sidebar.divider()
 
-    # Determine which pages are available
+    # Determine availability
     model_ready   = state.is_model_loaded()
     file_ready    = state.has_uploaded_file()
-    dataset_ready = False
-    if config.DATA_DIR.exists():
-        try:
-            dataset_ready = any(config.DATA_DIR.iterdir())
-        except Exception:
-            dataset_ready = False
+    try:
+        dataset_ready = config.DATA_DIR.exists() and any(config.DATA_DIR.iterdir())
+    except Exception:
+        dataset_ready = False
 
-    # Build options with availability markers
-    # Format: (display_label, internal_key, is_available)
     nav_options = [
-        ("🏠 Dashboard",        "🏠 Dashboard",        True),
-        ("📂 Binary Upload",    "📂 Binary Upload",    True),
-        (
-            "🔍 Malware Detection" if (model_ready and file_ready)
-            else "🔍 Malware Detection ⚠️",
-            "🔍 Malware Detection",
-            True,     # always selectable — shows its own guard message
-        ),
-        (
-            "🖼️ Dataset Gallery" if dataset_ready
-            else "🖼️ Dataset Gallery ⚠️",
-            "🖼️ Dataset Gallery",
-            True,     # always selectable — gallery shows its own info message
-        ),
-        ("🏋️ Model Training",  "🏋️ Model Training",   True),
-        ("🖥️ Digital Twin",    "🖥️ Digital Twin",     True),
+        ("Dashboard",        "Dashboard"),
+        ("Binary Upload",    "Binary Upload"),
+        ("Malware Detection" + (" (no file)" if not (model_ready and file_ready) else ""),
+         "Malware Detection"),
+        ("Dataset Gallery"   + (" (no dataset)" if not dataset_ready else ""),
+         "Dataset Gallery"),
+        ("Model Training",   "Model Training"),
+        ("Digital Twin",     "Digital Twin"),
     ]
 
-    display_labels  = [opt[0] for opt in nav_options]
-    internal_keys   = [opt[1] for opt in nav_options]
+    display_labels = [opt[0] for opt in nav_options]
+    internal_keys  = [opt[1] for opt in nav_options]
 
     selected_display = st.sidebar.radio(
-        "Navigation",
+        "nav",
         options=display_labels,
         label_visibility="hidden",
     )
-
-    # Map display label back to internal key (strips ⚠️ suffix)
     selected_index = display_labels.index(selected_display)
     page = internal_keys[selected_index]
 
-    # ── System status panel ───────────────────────────────────────────────────
     st.sidebar.divider()
-    st.sidebar.markdown("**System Status**")
 
-    if state.is_model_loaded():
-        device_info = st.session_state.get(state.KEY_DEVICE_INFO, 'unknown')
-        st.sidebar.success(f"✅ Model Ready ({device_info})")
-    else:
-        st.sidebar.warning("⚠️ No model loaded")
-        st.sidebar.caption("Run `scripts/train.py` first")
+    # System status panel
+    st.sidebar.markdown(
+        f'<div style="font-family:\'DM Sans\',sans-serif;font-size:11px;font-weight:600;'
+        f'letter-spacing:0.08em;text-transform:uppercase;'
+        f'color:{COLORS["text_secondary"]};margin-bottom:10px;">System</div>',
+        unsafe_allow_html=True,
+    )
+
+    model_status = status_badge('active', f'Model loaded ({st.session_state.get(state.KEY_DEVICE_INFO, "cpu")})') \
+        if model_ready else status_badge('inactive', 'No model — run training')
+    st.sidebar.markdown(model_status, unsafe_allow_html=True)
 
     if state.has_uploaded_file():
         meta = st.session_state[state.KEY_FILE_META]
-        st.sidebar.info(f"📄 {meta['name']}")
-    else:
-        st.sidebar.caption("No file uploaded")
+        file_status = status_badge('active', f'{meta["name"]}')
+        st.sidebar.markdown(file_status, unsafe_allow_html=True)
 
     if state.has_detection_result():
         result = st.session_state[state.KEY_DETECTION]
-        st.sidebar.success(f"🎯 {result['predicted_family']}")
+        det_status = status_badge('active', result['predicted_family'])
+        st.sidebar.markdown(det_status, unsafe_allow_html=True)
 
     if state.is_training_running():
-        st.sidebar.warning("🏋️ Training in progress…")
+        st.sidebar.markdown(
+            status_badge('inactive', 'Training in progress...'),
+            unsafe_allow_html=True,
+        )
 
-    # ── Module health summary (compact) ──────────────────────────────────────
     st.sidebar.divider()
+
+    # Module health compact
     try:
         from modules.dashboard.health import get_all_module_statuses
         statuses  = get_all_module_statuses()
         n_active  = sum(1 for s in statuses if s['status'] == 'active')
         n_total   = len(statuses)
-        st.sidebar.caption(f"Modules: {n_active}/{n_total} active")
+        st.sidebar.markdown(
+            f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:11px;'
+            f'color:{COLORS["text_secondary"]};">'
+            f'Modules: <span style="color:{COLORS["green"]};">{n_active}</span>/{n_total} active'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
     except Exception:
         pass
 
-    # ── Footer ────────────────────────────────────────────────────────────────
-    st.sidebar.divider()
-    st.sidebar.caption("COMSATS University, Islamabad")
-    st.sidebar.caption("BS Cyber Security 2023-2027")
+    st.sidebar.markdown(
+        f'<div style="position:absolute;bottom:20px;left:16px;right:16px;">'
+        f'<div style="font-family:\'DM Sans\',sans-serif;font-size:11px;'
+        f'color:{COLORS["text_secondary"]};">COMSATS University Islamabad</div>'
+        f'<div style="font-family:\'DM Sans\',sans-serif;font-size:11px;'
+        f'color:{COLORS["text_secondary"]};">BS Cyber Security 2023-2027</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
     return page
 
@@ -231,22 +243,22 @@ def main() -> None:
     load_global_resources()
     page = render_sidebar()
 
-    if page == "🏠 Dashboard":
+    if page == "Dashboard":
         from modules.dashboard.pages.home import render
         render()
-    elif page == "📂 Binary Upload":
+    elif page == "Binary Upload":
         from modules.dashboard.pages.upload import render
         render()
-    elif page == "🔍 Malware Detection":
+    elif page == "Malware Detection":
         from modules.dashboard.pages.detection import render
         render()
-    elif page == "🖼️ Dataset Gallery":
+    elif page == "Dataset Gallery":
         from modules.dashboard.pages.gallery import render
         render()
-    elif page == "🏋️ Model Training":
+    elif page == "Model Training":
         from modules.dashboard.pages.training import render
         render()
-    elif page == "🖥️ Digital Twin":
+    elif page == "Digital Twin":
         from modules.dashboard.pages.digital_twin import render
         render()
 

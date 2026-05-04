@@ -7,10 +7,12 @@ import streamlit as st
 
 
 def render():
-    st.title("🖥️ Digital Twin Simulation")
+    from modules.dashboard.theme import apply_theme, COLORS, section_header, mono, status_badge, confidence_bar_html, kpi_card
+    apply_theme()
+    st.title("Digital Twin Simulation")
     st.markdown("---")
     st.warning(
-        "⚠️ **Module 1 — Digital Twin Simulation** is not yet implemented.\n\n"
+        "Module 1 — Digital Twin Simulation is not yet implemented.\n\n"
         "This module will provide a Docker + Mininet based IIoT simulation "
         "environment for safe malware execution and behavioral observation."
     )

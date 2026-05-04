@@ -34,7 +34,9 @@ _INITIAL_PROGRESS = 0.05
 
 
 def render():
-    st.title("🏋️ Model Training")
+    from modules.dashboard.theme import apply_theme, COLORS, section_header, mono, status_badge, confidence_bar_html, kpi_card
+    apply_theme()
+    st.title("Model Training")
     st.markdown(
         "Configure and launch a training run directly from the dashboard. "
         "Training runs `scripts/train.py` as a background process — you can "

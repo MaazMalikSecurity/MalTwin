@@ -15,13 +15,15 @@ from modules.dashboard import state
 
 
 def render():
-    st.title("🔍 Malware Detection & Classification")
+    from modules.dashboard.theme import apply_theme, COLORS, section_header, mono, status_badge, confidence_bar_html, kpi_card
+    apply_theme()
+    st.title("Malware Detection")
     st.markdown("---")
 
     # ── Guard: no file uploaded ───────────────────────────────────────────────
     if not state.has_uploaded_file():
         st.warning(
-            "⚠️ No binary file loaded. "
+            "No binary file loaded. "
             "Please upload a file on the **Binary Upload** page first."
         )
         return
@@ -29,7 +31,7 @@ def render():
     # ── Guard: no model loaded ────────────────────────────────────────────────
     if not state.is_model_loaded():
         st.warning(
-            "⚠️ No trained model available. "
+            "No trained model available. "
             "Run `python scripts/train.py` to train the model, then restart the dashboard."
         )
         return
@@ -76,7 +78,7 @@ def _render_file_summary() -> None:
         st.markdown(f"**Format:** {meta['format']}")
     with col3:
         st.markdown("**SHA-256:**")
-        st.code(meta['sha256'], language=None)
+        st.markdown(mono(meta['sha256']), unsafe_allow_html=True)
 
 
 def _run_detection() -> None:
@@ -215,10 +217,10 @@ def _render_results() -> None:
     st.subheader("Detection Result")
 
     if confidence >= config.CONFIDENCE_GREEN:
-        st.success(f"🎯 **{family}** detected with **{confidence * 100:.1f}%** confidence")
+        st.success(f"Detected: {family} — {confidence * 100:.1f}% confidence")
     elif confidence >= config.CONFIDENCE_AMBER:
         st.warning(
-            f"⚠️ **{family}** detected with **{confidence * 100:.1f}%** confidence\n\n"
+            f"Detected: {family} — {confidence * 100:.1f}% confidence\n\n"
             "Low confidence — results may be unreliable. Manual verification recommended."
         )
     else:
@@ -229,19 +231,24 @@ def _render_results() -> None:
             "Action: Perform a manual expert review before trusting this result."
         )
 
-    confidence_pct = int(confidence * 100)
-    color_label = (
-        "🟢 High Confidence"   if confidence >= config.CONFIDENCE_GREEN
-        else "🟡 Medium Confidence" if confidence >= config.CONFIDENCE_AMBER
-        else "🔴 Low Confidence"
+    from modules.dashboard.theme import confidence_bar_html, COLORS
+    st.markdown(
+        f'<div style="background:{COLORS["bg_secondary"]};border:1px solid {COLORS["border"]};'
+        f'border-radius:6px;padding:20px 24px;margin-bottom:16px;">'
+        f'<div style="font-family:\'DM Sans\',sans-serif;font-size:13px;'
+        f'color:{COLORS["text_secondary"]};margin-bottom:8px;letter-spacing:0.04em;">'
+        f'DETECTED FAMILY</div>'
+        f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:26px;'
+        f'font-weight:700;color:{COLORS["text_primary"]};margin-bottom:16px;">'
+        f'{family}</div>'
+        f'{confidence_bar_html(confidence, family)}'
+        f'</div>',
+        unsafe_allow_html=True,
     )
-    col_bar, col_label = st.columns([3, 1])
-    col_bar.progress(confidence_pct)
-    col_label.markdown(f"**{confidence_pct}%** {color_label}")
 
     # Benign class notice (architectural constraint — SRS_COMPLIANCE.md)
     st.caption(
-        "ℹ️ MalTwin classifies binaries into known malware families only. "
+        "MalTwin classifies binaries into known malware families only. "
         "There is no benign class — every uploaded binary receives a malware family prediction. "
         "Low confidence scores (<50%) indicate the binary may not match any trained family. "
         "This is a known architectural constraint of the Malimg-trained model."
@@ -423,13 +430,14 @@ def _build_report_data() -> dict:
 def _render_probability_chart(probabilities: dict) -> None:
     """
     Horizontal bar chart of all class probabilities, sorted descending.
-    Top-1 bar is red (#FF4B4B), all others are blue (#4A90D9).
+    Top-1 bar uses accent color, all others use bg_tertiary.
     ALL classes shown including zero-probability ones (SRS FR5.3).
     """
+    from modules.dashboard.theme import apply_chart_theme, COLORS
     sorted_probs = sorted(probabilities.items(), key=lambda x: x[1], reverse=True)
     families = [item[0] for item in sorted_probs]
     probs    = [item[1] for item in sorted_probs]
-    colors   = ['#FF4B4B'] + ['#4A90D9'] * (len(families) - 1)
+    colors   = [COLORS['accent']] + [COLORS['bg_tertiary']] * (len(families) - 1)
 
     fig = go.Figure(go.Bar(
         x=probs,
@@ -440,15 +448,19 @@ def _render_probability_chart(probabilities: dict) -> None:
         textposition='outside',
     ))
     fig.update_layout(
-        title="Detection Probability per Malware Family",
         xaxis_title="Probability",
         yaxis_title="Malware Family",
-        template="plotly_dark",
         height=max(400, len(families) * 22),
         xaxis=dict(range=[0, 1.05]),
         margin=dict(l=150, r=80, t=50, b=40),
         showlegend=False,
     )
+    fig.update_traces(
+        marker_line_color=COLORS['border'],
+        marker_line_width=0.5,
+        textfont=dict(color=COLORS['text_secondary'], size=11),
+    )
+    apply_chart_theme(fig)
     st.plotly_chart(fig, use_container_width=True)
 
 

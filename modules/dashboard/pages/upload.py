@@ -18,7 +18,9 @@ from modules.binary_to_image.utils import (
 from modules.dashboard import state
 
 def render():
-    st.title("📂 Binary Upload & Visualization")
+    from modules.dashboard.theme import apply_theme, COLORS, section_header, mono, status_badge, confidence_bar_html, kpi_card
+    apply_theme()
+    st.title("Binary Upload")
     st.markdown(
         "Upload a PE (.exe, .dll) or ELF binary file to convert it into a grayscale "
         "image for analysis. The image captures the structural byte patterns of the "
@@ -166,7 +168,7 @@ def _render_results() -> None:
 
         # SHA-256 in monospace for easy copying
         st.markdown("**SHA-256 (copy):**")
-        st.code(meta['sha256'], language=None)
+        st.markdown(mono(meta['sha256']), unsafe_allow_html=True)
 
         # Pixel intensity histogram
         st.subheader("Pixel Intensity Distribution")
@@ -178,14 +180,13 @@ def _render_results() -> None:
             name='Byte frequency',
         ))
         fig.update_layout(
-            title="Pixel Intensity Distribution (256 bins)",
             xaxis_title="Byte Value (0–255)",
             yaxis_title="Pixel Count",
-            template="plotly_dark",
             height=300,
             showlegend=False,
-            margin=dict(l=40, r=20, t=40, b=40),
         )
+        from modules.dashboard.theme import apply_chart_theme
+        apply_chart_theme(fig, title='Pixel Intensity Distribution (256 bins)')
         st.plotly_chart(fig, use_container_width=True)
 
     st.info("➡️ Navigate to **Malware Detection** in the sidebar to run analysis.")
