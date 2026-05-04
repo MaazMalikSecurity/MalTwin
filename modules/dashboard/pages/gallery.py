@@ -72,7 +72,9 @@ def _count_family_images(data_dir: str, family_name: str) -> int:
 
 
 def render():
-    st.title("🖼️ Dataset Gallery")
+    from modules.dashboard.theme import apply_theme, COLORS, section_header, mono, status_badge, confidence_bar_html, kpi_card
+    apply_theme()
+    st.title("Dataset Gallery")
     st.markdown(
         "Browse sample grayscale images from each malware family in the Malimg dataset. "
         "Each image is the raw byte structure of a malware binary visualised as a "

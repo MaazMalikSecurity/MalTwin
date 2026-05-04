@@ -20,25 +20,21 @@ from modules.dashboard import state
 
 
 def render():
-    st.title("🏠 System Overview Dashboard")
+    from modules.dashboard.theme import apply_theme, COLORS, section_header, mono, status_badge, confidence_bar_html, kpi_card
+    apply_theme()
+    st.title("System Overview")
     st.markdown("---")
 
     # ── KPI Cards ─────────────────────────────────────────────────────────────
     stats = get_detection_stats(config.DB_PATH)
+    acc   = stats.get('model_accuracy')
+    acc_str = f"{acc * 100:.1f}%" if acc is not None else "—"
 
     col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(label="Total Files Analyzed", value=stats.get('total_analyzed', 0))
-    with col2:
-        st.metric(label="Malware Detected",     value=stats.get('total_malware', 0))
-    with col3:
-        st.metric(label="Benign Files",         value=stats.get('total_benign', 0))
-    with col4:
-        acc = stats.get('model_accuracy')
-        st.metric(
-            label="Model Accuracy",
-            value=f"{acc * 100:.1f}%" if acc is not None else "N/A",
-        )
+    col1.markdown(kpi_card("Total Analyzed",  str(stats.get('total_analyzed', 0))), unsafe_allow_html=True)
+    col2.markdown(kpi_card("Malware Detected", str(stats.get('total_malware', 0))), unsafe_allow_html=True)
+    col3.markdown(kpi_card("Benign Files",    str(stats.get('total_benign', 0))),   unsafe_allow_html=True)
+    col4.markdown(kpi_card("Model Accuracy",  acc_str, accent=acc is not None),      unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -46,7 +42,7 @@ def render():
     col_left, col_right = st.columns([2, 1])
 
     with col_left:
-        st.subheader("Detection Activity (Last 7 Days)")
+        section_header("Detection Activity", "Last 7 days")
         _render_activity_chart(config.DB_PATH)
 
     with col_right:
@@ -69,7 +65,7 @@ def render():
     st.markdown("---")
 
     # ── Quick recent feed (always visible — SRS FR1.4) ───────────────────────
-    st.subheader("Recent Detections")
+    section_header("Recent Detections")
     _render_recent_feed_baseline()
 
     # ── Full filterable history ───────────────────────────────────────────────
@@ -79,12 +75,13 @@ def render():
     st.markdown("---")
 
     # ── Module Status Table ───────────────────────────────────────────────────
-    st.subheader("Module Status")
+    section_header("Module Status")
     _render_module_status()
 
 
 def _render_activity_chart(db_path):
     """Fetch event counts per day for the last 7 days and render a Plotly line chart."""
+    from modules.dashboard.theme import apply_chart_theme, COLORS
     events = get_events_by_date_range(db_path, days_back=7)
 
     # Build date → count mapping for last 7 days
@@ -109,19 +106,18 @@ def _render_activity_chart(db_path):
         x=dates,
         y=counts,
         mode='lines+markers',
-        marker=dict(size=8, color='#FF4B4B'),
-        line=dict(color='#FF4B4B', width=2),
+        marker=dict(size=8, color=COLORS['accent']),
+        line=dict(color=COLORS['accent'], width=2),
         name='Detections',
     ))
     fig.update_layout(
         xaxis_title="Date",
         yaxis_title="Detections",
-        template="plotly_dark",
         height=250,
-        margin=dict(l=40, r=20, t=20, b=40),
         showlegend=False,
         yaxis=dict(rangemode='nonnegative'),
     )
+    apply_chart_theme(fig)
     st.plotly_chart(fig, use_container_width=True)
 
 
