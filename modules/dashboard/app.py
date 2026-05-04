@@ -142,7 +142,10 @@ def render_sidebar() -> str:
     # Determine availability
     model_ready   = state.is_model_loaded()
     file_ready    = state.has_uploaded_file()
-    dataset_ready = config.DATA_DIR.exists() and any(config.DATA_DIR.iterdir())
+    try:
+        dataset_ready = config.DATA_DIR.exists() and any(config.DATA_DIR.iterdir())
+    except Exception:
+        dataset_ready = False
 
     nav_options = [
         ("Dashboard",        "Dashboard"),

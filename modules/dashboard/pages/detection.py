@@ -77,7 +77,6 @@ def _render_file_summary() -> None:
         st.markdown(f"**Size:** {meta['size_human']}")
         st.markdown(f"**Format:** {meta['format']}")
     with col3:
-        from modules.dashboard.theme import mono
         st.markdown("**SHA-256:**")
         st.markdown(mono(meta['sha256']), unsafe_allow_html=True)
 
