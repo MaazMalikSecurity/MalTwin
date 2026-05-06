@@ -360,17 +360,19 @@ Integration tests are marked `@pytest.mark.integration` and require the Malimg d
 | Page | Description |
 |------|-------------|
 | 🏠 Dashboard | KPI cards (total analyzed, malware count, model accuracy), 7-day activity chart, detection history with filters + CSV export, system stats, module status |
-| 📂 Binary Upload | Upload `.exe`, `.dll`, or `.elf` (ELF binaries without extensions should be renamed to `.elf` for upload), validates magic bytes, 50 MB limit, shows metadata table + pixel histogram |
+| 📂 Binary Upload | Upload `.exe`, `.dll`, or `.elf`, validates magic bytes, 50 MB limit, shows metadata table + pixel histogram |
 | 🔍 Malware Detection | Run CNN inference on the uploaded binary, shows predicted family with confidence bar (green/amber/red), top-3 predictions, full 25-class probability chart, MITRE ATT&CK for ICS mapping, PDF/JSON report export |
 | 🖼️ Dataset Gallery | Per-family gallery with MITRE context expander |
 | 🏋️ Model Training | Configure and run training from the dashboard with live logs and progress |
 | 🖥️ Digital Twin | Stub page — Module 1 (Docker/Mininet IIoT simulation) is deferred to a future sprint |
 
+**ELF upload note:** Linux/IIoT ELF binaries often have no extension. Rename them to `.elf` before uploading so the browser file picker will accept them. Validation still uses magic bytes, not the extension.
+
 ---
 
 ## Configuration Reference
 
-Most settings live in `.env` (copied from `.env.example`). `config.py` reads them at startup and also defines runtime constants.
+Environment variables in `.env` (copied from `.env.example`) control paths and training settings. `config.py` reads them at startup and also defines runtime constants.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
