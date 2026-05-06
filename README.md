@@ -32,6 +32,7 @@ Binary (.exe / .dll / ELF)
 ## Features
 
 - **Binary visualisation** — converts any PE/ELF binary to a structural grayscale image with no ML dependencies
+- **Upload validation & metadata** — 50 MB cap, magic-byte validation, SHA-256 hashing, and pixel histogram
 - **25-family CNN classifier** — 3-block ConvNet trained on the Malimg dataset with weighted oversampling to handle class imbalance
 - **Confidence-coded results** — green / amber / red UI based on prediction confidence thresholds
 - **MITRE ATT&CK for ICS mapping** — tactics and techniques for each detected malware family
@@ -41,6 +42,7 @@ Binary (.exe / .dll / ELF)
 - **Dataset gallery** — per-family image grids with MITRE context
 - **Training manager** — run model training from the dashboard with live logs and progress
 - **System health checks** — module status + CPU/RAM metrics in the dashboard
+- **Custom dashboard theme** — dark industrial Streamlit theme with CSS overrides and chart styling
 - **Streamlit dashboard** — six-page web UI (overview, upload, detection, gallery, training, digital twin stub)
 - **CLI & utilities** — training, evaluation, binary conversion, synthetic data generation, MITRE verification
 
@@ -57,7 +59,7 @@ MalTwin/
 ├── .env.example                     # Copy to .env and edit before running
 ├── Implement.md                     # Implementation walkthrough + test notes
 ├── SRS_COMPLIANCE.md                # SRS traceability matrix
-├── MalTwin_SRS.pdf                  # SRS document
+├── MALTWIN_SRS.md                   # SRS document (Markdown)
 ├── MalTwin_Testing_Documentation.docx
 ├── verify_mitre.py                  # Validate MITRE mapping vs class_names.json
 │
@@ -91,6 +93,7 @@ MalTwin/
 │   │   ├── app.py                   # Streamlit entry point + navigation routing
 │   │   ├── db.py                    # SQLite helpers (WAL mode, init, log, query)
 │   │   ├── health.py                # Module health + system stats
+│   │   ├── theme.py                 # Custom Streamlit theme + CSS helpers
 │   │   ├── state.py                 # session_state key constants + helpers
 │   │   └── pages/
 │   │       ├── home.py              # KPI cards, activity chart, module status
@@ -113,6 +116,7 @@ MalTwin/
 │   ├── malimg/                      # ← Download dataset here (not in git)
 │   ├── processed/                   # class_names.json, eval_metrics.json, confusion_matrix.png (generated)
 │   ├── logs/                        # Sample SQLite DB snapshot (optional)
+│   │   └── maltwin.db
 │   └── mitre_ics_mapping.json       # Static MITRE ATT&CK ICS reference data
 │
 ├── models/
@@ -346,7 +350,7 @@ Integration tests are marked `@pytest.mark.integration` and require the Malimg d
 
 - **Implement.md** — implementation walkthrough, design notes, and test execution logs
 - **SRS_COMPLIANCE.md** — requirements traceability matrix against the SRS
-- **MalTwin_SRS.pdf** — full Software Requirements Specification document
+- **MALTWIN_SRS.md** — full Software Requirements Specification document
 - **MalTwin_Testing_Documentation.docx** — formal testing documentation and results
 
 ---
@@ -356,17 +360,19 @@ Integration tests are marked `@pytest.mark.integration` and require the Malimg d
 | Page | Description |
 |------|-------------|
 | 🏠 Dashboard | KPI cards (total analyzed, malware count, model accuracy), 7-day activity chart, detection history with filters + CSV export, system stats, module status |
-| 📂 Binary Upload | Upload `.exe` or `.dll`, validates format, converts to 128×128 greyscale image, displays metadata table and pixel intensity histogram |
+| 📂 Binary Upload | Upload `.exe`, `.dll`, or `.elf`, validates magic bytes, 50 MB limit, shows metadata table + pixel histogram |
 | 🔍 Malware Detection | Run CNN inference on the uploaded binary, shows predicted family with confidence bar (green/amber/red), top-3 predictions, full 25-class probability chart, MITRE ATT&CK for ICS mapping, PDF/JSON report export |
 | 🖼️ Dataset Gallery | Per-family gallery with MITRE context expander |
 | 🏋️ Model Training | Configure and run training from the dashboard with live logs and progress |
 | 🖥️ Digital Twin | Stub page — Module 1 (Docker/Mininet IIoT simulation) is deferred to a future sprint |
 
+**ELF upload note:** Linux/IIoT ELF binaries often have no extension. Rename them to `.elf` before uploading so the browser file picker will accept them. Validation still uses magic bytes, not the extension.
+
 ---
 
 ## Configuration Reference
 
-All settings live in `.env` (copied from `.env.example`). `config.py` reads them at startup.
+Environment variables in `.env` (copied from `.env.example`) control paths and training settings. `config.py` reads them at startup and also defines runtime constants.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -374,7 +380,7 @@ All settings live in `.env` (copied from `.env.example`). `config.py` reads them
 | `MALTWIN_PROCESSED_DIR` | `./data/processed` | Processed artifacts (class_names, metrics, confusion matrix) |
 | `MALTWIN_MODEL_DIR` | `./models` | Model checkpoints and best model path |
 | `MALTWIN_LOG_DIR` | `./logs` | SQLite detection database directory |
-| `MALTWIN_REPORTS_DIR` | `./reports` | PDF/JSON report output directory |
+| `MALTWIN_REPORTS_DIR` | `./reports` | PDF/JSON report output directory (config.py fallback: `./data/reports`) |
 | `MALTWIN_IMG_SIZE` | `128` | Output image size (N×N) |
 | `MALTWIN_BATCH_SIZE` | `32` | Training batch size |
 | `MALTWIN_EPOCHS` | `30` | Training epochs |
@@ -390,6 +396,15 @@ All settings live in `.env` (copied from `.env.example`). `config.py` reads them
 | `MALTWIN_RANDOM_SEED` | `42` | Global random seed |
 | `MALTWIN_CONFIDENCE_GREEN` | `0.80` | Green confidence threshold for UI |
 | `MALTWIN_CONFIDENCE_AMBER` | `0.50` | Amber confidence threshold for UI |
+
+Additional runtime constants (defined in `config.py`):
+
+- `MAX_UPLOAD_BYTES` — 50 MB upload limit
+- `ACCEPTED_EXTENSIONS` — `.exe`, `.dll`, `.elf`
+- `STREAMLIT_PORT` — `8501`
+- `DASHBOARD_TITLE` — `MalTwin — IIoT Malware Detection`
+- `MALIMG_EXPECTED_FAMILIES` — `25`
+- `MALIMG_TOTAL_SAMPLES` — `9339`
 
 ---
 
